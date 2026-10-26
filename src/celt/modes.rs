@@ -1,10 +1,10 @@
 #![allow(clippy::excessive_precision)]
 
-//! CELT static mode data (48 kHz / 960 / 120 overlap).
+//! Modo estático de CELT: 48 kHz, tramas de 960 muestras y 120 de solapamiento.
 //!
-//! The values are ported from libopus `modes.c` + `static_modes_float.h`.
+//! Los valores vienen de `modes.c` y `static_modes_float.h` de libopus.
 
-/// CELT pulse cache tables used by allocation/rate logic.
+/// Tablas de la caché de pulsos que usa la asignación de bits.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct PulseCache {
     pub index: &'static [i16],
@@ -12,7 +12,7 @@ pub(crate) struct PulseCache {
     pub caps: &'static [u8],
 }
 
-/// Flattened CELT mode definition for decoder use.
+/// Definición del modo de CELT que usa el decodificador.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct CeltMode {
     pub overlap: usize,
@@ -27,7 +27,7 @@ pub(crate) struct CeltMode {
     pub cache: PulseCache,
 }
 
-/// Return the static CELT mode for 48 kHz, 20 ms frames, 2.5 ms overlap.
+/// Modo estático de CELT: 48 kHz, tramas de 20 ms y 2,5 ms de solapamiento.
 pub(crate) fn mode48000_960_120() -> &'static CeltMode {
     &MODE_48000_960_120
 }

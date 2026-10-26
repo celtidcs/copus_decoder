@@ -1,16 +1,22 @@
-//! SILK stereo signaling parser helpers for Phase 3a.
+//! Estéreo de SILK: lectura de la predicción y del indicador de solo medio, y conversión de
+//! medio y lateral a izquierdo y derecho.
 
+use super::fixed::{rshift_round, sat16, smlawb, smulbb, smulww};
 use crate::entropy::EcDec;
 
 use super::tables;
 
 const STEREO_STEP_Q16: i32 = 6_554; // SILK_FIX_CONST(0.5 / 5, 16)
 const STEREO_INTERP_LEN_MS: usize = 8;
+/// El símbolo conjunto codifica el grupo de cuantificación de los dos predictores, 5 × 5
+/// (`silk_stereo_decode_pred`).
+const STEREO_PRED_GROUPS: i32 = 5;
+/// Intervalos de `STEREO_PRED_QUANT_Q13` por grupo: los elige `UNIFORM3_ICDF`
+/// (`silk_stereo_decode_pred`).
+const STEREO_PRED_INTERVALS_PER_GROUP: i32 = 3;
 
-/// Decoder-side SILK stereo state.
-///
-/// Params: none.
-/// Returns: persistent predictor and sample history for MS->LR conversion.
+/// Estado estéreo de SILK del decodificador: los predictores de la trama anterior, en Q13, y las
+/// dos últimas muestras de medio y de lateral, para la conversión a izquierdo y derecho.
 #[derive(Debug, Clone, Default)]
 pub(super) struct StereoState {
     pub pred_prev_q13: [i16; 2],
@@ -18,27 +24,35 @@ pub(super) struct StereoState {
     pub s_side: [i16; 2],
 }
 
-/// Decode SILK stereo predictor signaling (`silk_stereo_decode_pred`).
-///
-/// Params: `dec` is the shared Opus range decoder over SILK frame payload.
-/// Returns: two MS predictor values in Q13.
+impl StereoState {
+    /// Prepara el estado para la primera trama estéreo tras una mono: olvida los predictores y la
+    /// historia del lateral, que la trama mono no ha mantenido, y conserva la del medio, que sí
+    /// (`silk_Decode` en `dec_API.c` de libopus).
+    pub(super) fn reset_mono_to_stereo(&mut self) {
+        self.pred_prev_q13 = [0; 2];
+        self.s_side = [0; 2];
+    }
+}
+
+/// Lee con el decodificador de rango compartido `dec` los dos predictores estéreo de la trama
+/// (`silk_stereo_decode_pred`) y los devuelve en Q13.
 pub(super) fn decode_stereo_pred(dec: &mut EcDec<'_>) -> [i32; 2] {
     let mut ix = [[0i32; 3]; 2];
-    let joint = dec.dec_icdf(&tables::STEREO_PRED_JOINT_ICDF, 8);
-    ix[0][2] = joint / 5;
-    ix[1][2] = joint - 5 * ix[0][2];
+    let joint = dec.dec_icdf(&tables::STEREO_PRED_JOINT_ICDF, super::tables::ICDF_FTB);
+    ix[0][2] = joint / STEREO_PRED_GROUPS;
+    ix[1][2] = joint - STEREO_PRED_GROUPS * ix[0][2];
 
     for side in &mut ix {
-        side[0] = dec.dec_icdf(&tables::UNIFORM3_ICDF, 8);
-        side[1] = dec.dec_icdf(&tables::UNIFORM5_ICDF, 8);
+        side[0] = dec.dec_icdf(&tables::UNIFORM3_ICDF, super::tables::ICDF_FTB);
+        side[1] = dec.dec_icdf(&tables::UNIFORM5_ICDF, super::tables::ICDF_FTB);
     }
 
     let mut pred_q13 = [0i32; 2];
     for (n, side) in ix.iter_mut().enumerate() {
-        side[0] += 3 * side[2];
+        side[0] += STEREO_PRED_INTERVALS_PER_GROUP * side[2];
         let low_q13 = tables::STEREO_PRED_QUANT_Q13[side[0] as usize];
         let high_q13 = tables::STEREO_PRED_QUANT_Q13[side[0] as usize + 1];
-        let step_q13 = mul_wb(high_q13 - low_q13, STEREO_STEP_Q16);
+        let step_q13 = smulww(high_q13 - low_q13, STEREO_STEP_Q16);
         pred_q13[n] = low_q13 + step_q13 * (2 * side[1] + 1);
     }
 
@@ -46,34 +60,22 @@ pub(super) fn decode_stereo_pred(dec: &mut EcDec<'_>) -> [i32; 2] {
     pred_q13
 }
 
-/// Decode SILK "mid-only coded" stereo flag (`silk_stereo_decode_mid_only`).
-///
-/// Params: `dec` is the shared Opus range decoder over SILK frame payload.
-/// Returns: true when side channel is omitted for this frame.
+/// Lee con `dec` el indicador de solo medio (`silk_stereo_decode_mid_only`): verdadero si la
+/// trama no lleva canal lateral.
 pub(super) fn decode_mid_only(dec: &mut EcDec<'_>) -> bool {
-    dec.dec_icdf(&tables::STEREO_ONLY_CODE_MID_ICDF, 8) != 0
+    dec.dec_icdf(&tables::STEREO_ONLY_CODE_MID_ICDF, super::tables::ICDF_FTB) != 0
 }
 
-/// Multiply helper matching SILK `silk_SMULWB` behavior.
-///
-/// Params: `a` and `b` are signed fixed-point values.
-/// Returns: high-word product `(a*b)>>16`.
-fn mul_wb(a: i32, b: i32) -> i32 {
-    ((a as i64 * b as i64) >> 16) as i32
-}
-
-/// Convert one SILK internal frame from adaptive mid/side to left/right.
-///
-/// Params: mutable stereo `state`, mutable `mid` and `side` frame buffers,
-/// current `pred_q13`, and internal sampling rate `fs_khz`.
-/// Returns: nothing; `mid` becomes left and `side` becomes right in place.
+/// Convierte en el sitio una trama interna de medio y lateral a izquierdo y derecho: `mid` pasa
+/// a ser el izquierdo y `side`, el derecho, retrasados una muestra. El lateral se completa con
+/// la predicción `pred_q13`, interpolada desde la de `state` durante los 8 primeros ms a la
+/// frecuencia interna `fs_khz`. Actualiza `state` para la trama siguiente.
 pub(super) fn ms_to_lr(
     state: &mut StereoState,
     mid: &mut [i16],
     side: &mut [i16],
     pred_q13: [i32; 2],
     fs_khz: u32,
-    _packet_idx: usize,
 ) {
     let frame_length = mid.len();
     debug_assert_eq!(side.len(), frame_length);
@@ -128,49 +130,23 @@ pub(super) fn ms_to_lr(
     side.copy_from_slice(&x2[1..1 + frame_length]);
 }
 
-/// Multiply signed low 16-bit halves.
-///
-/// Params: signed `a32` and `b32`.
-/// Returns: signed 32-bit product.
-fn smulbb(a32: i32, b32: i32) -> i32 {
-    (a32 as i16 as i32) * (b32 as i16 as i32)
-}
+#[cfg(test)]
+mod tests {
+    use super::StereoState;
 
-/// Multiply by the signed low 16-bit half of `b32` and keep high word.
-///
-/// Params: signed `a32` and signed `b32`.
-/// Returns: high-word signed product.
-fn smulwb(a32: i32, b32: i32) -> i32 {
-    let b16 = b32 as i16 as i32;
-    let high = (a32 >> 16) * b16;
-    let low = ((a32 & 0xFFFF) * b16) >> 16;
-    high.wrapping_add(low)
-}
-
-/// Approximate `a32 + ((b32 * (i16)c32) >> 16)`.
-///
-/// Params: accumulator `a32`, multiplicand `b32`, and signed `c32`.
-/// Returns: accumulated high-word product.
-fn smlawb(a32: i32, b32: i32, c32: i32) -> i32 {
-    a32.wrapping_add(smulwb(b32, c32))
-}
-
-/// Saturate to `i16`.
-///
-/// Params: signed `value`.
-/// Returns: clamped 16-bit PCM sample.
-fn sat16(value: i32) -> i16 {
-    value.clamp(i16::MIN as i32, i16::MAX as i32) as i16
-}
-
-/// Round a signed arithmetic right shift.
-///
-/// Params: signed `value` and positive `shift`.
-/// Returns: rounded shifted value.
-fn rshift_round(value: i32, shift: usize) -> i32 {
-    if shift == 1 {
-        (value >> 1) + (value & 1)
-    } else {
-        ((value >> (shift - 1)) + 1) >> 1
+    /// Al pasar de mono a estéreo se olvidan los predictores y la historia del lateral, y se
+    /// conserva la del medio. La red de equivalencia no lo ejercita: en sus transiciones el
+    /// lateral ya está a cero.
+    #[test]
+    fn reset_mono_to_stereo_keeps_only_mid_history() {
+        let mut state = StereoState {
+            pred_prev_q13: [11, -12],
+            s_mid: [13, -14],
+            s_side: [15, -16],
+        };
+        state.reset_mono_to_stereo();
+        assert_eq!(state.pred_prev_q13, [0, 0]);
+        assert_eq!(state.s_side, [0, 0]);
+        assert_eq!(state.s_mid, [13, -14]);
     }
 }

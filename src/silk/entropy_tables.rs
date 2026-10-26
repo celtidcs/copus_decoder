@@ -1,33 +1,35 @@
-//! SILK entropy decoding tables used by Phase 3a LBRR payload consumption.
+//! Tablas de decodificación entrópica de la información lateral y los pulsos de SILK.
 
-/// Number of SILK rate levels.
+/// Número de niveles de tasa de los pulsos de SILK.
 pub(super) const N_RATE_LEVELS: usize = 10;
-/// Maximum pulse count symbol before LSB extension (`SILK_MAX_PULSES`).
+/// Mayor número de pulsos de un bloque sin extensión de bits menos significativos
+/// (`SILK_MAX_PULSES`).
 pub(super) const SILK_MAX_PULSES: i32 = 16;
-/// Shell frame length in samples.
+/// Longitud en muestras de un bloque de la capa de conchas de los pulsos.
 pub(super) const SHELL_CODEC_FRAME_LENGTH: usize = 16;
-/// Maximum NLSF quant amplitude used by entropy decode.
+/// Mayor amplitud del residuo NLSF de etapa 2 sin extensión.
 pub(super) const NLSF_QUANT_MAX_AMPLITUDE: i32 = 4;
 
-/// VAD-aware signal type + quant-offset iCDF.
+/// iCDF del símbolo conjunto de tipo de señal y desplazamiento del cuantificador, con actividad
+/// de voz.
 pub(super) const TYPE_OFFSET_VAD_ICDF: [u8; 4] = [232, 158, 10, 0];
-/// No-VAD signal type + quant-offset iCDF.
+/// iCDF del mismo símbolo sin actividad de voz.
 pub(super) const TYPE_OFFSET_NO_VAD_ICDF: [u8; 2] = [230, 0];
 
-/// NLSF interpolation-factor iCDF.
+/// iCDF del factor de interpolación de las NLSF.
 pub(super) const NLSF_INTERP_FACTOR_ICDF: [u8; 5] = [243, 221, 192, 181, 0];
-/// NLSF extension iCDF used for tails.
+/// iCDF de la extensión del residuo NLSF de etapa 2 en los extremos de su rango.
 pub(super) const NLSF_EXT_ICDF: [u8; 7] = [100, 40, 16, 7, 3, 1, 0];
 
-/// Uniform entropy tables used by SILK side information decode.
+/// Tablas uniformes de 4, 6 y 8 símbolos de la información lateral de SILK.
 pub(super) const UNIFORM4_ICDF: [u8; 4] = [192, 128, 64, 0];
 pub(super) const UNIFORM6_ICDF: [u8; 6] = [213, 171, 128, 85, 43, 0];
 pub(super) const UNIFORM8_ICDF: [u8; 8] = [224, 192, 160, 128, 96, 64, 32, 0];
 
-/// LSB-pulse extension iCDF.
+/// iCDF de cada bit menos significativo extra de un pulso.
 pub(super) const LSB_ICDF: [u8; 2] = [120, 0];
 
-/// Gain coding tables.
+/// Tablas de las ganancias.
 pub(super) const GAIN_ICDF: [[u8; 8]; 3] = [
     [224, 112, 44, 15, 3, 2, 1, 0],
     [254, 237, 192, 132, 70, 23, 4, 0],
@@ -38,7 +40,7 @@ pub(super) const DELTA_GAIN_ICDF: [u8; 41] = [
     17, 16, 15, 14, 13, 12, 11, 10, 9, 8, 7, 6, 5, 4, 3, 2, 1, 0,
 ];
 
-/// Pitch decoding tables.
+/// Tablas del tono.
 pub(super) const PITCH_LAG_ICDF: [u8; 32] = [
     253, 250, 244, 233, 212, 182, 150, 131, 120, 110, 98, 85, 72, 60, 49, 40, 32, 25, 19, 15, 13,
     11, 9, 8, 7, 6, 5, 4, 3, 2, 1, 0,
@@ -55,7 +57,7 @@ pub(super) const PITCH_CONTOUR_10MS_ICDF: [u8; 12] =
     [165, 119, 80, 61, 47, 35, 27, 20, 14, 9, 4, 0];
 pub(super) const PITCH_CONTOUR_10MS_NB_ICDF: [u8; 3] = [113, 63, 0];
 
-/// LTP coding tables.
+/// Tablas del LTP.
 pub(super) const LTP_PER_INDEX_ICDF: [u8; 3] = [179, 99, 0];
 pub(super) const LTP_GAIN_ICDF_0: [u8; 8] = [71, 56, 43, 30, 21, 12, 6, 0];
 pub(super) const LTP_GAIN_ICDF_1: [u8; 16] = [
@@ -67,7 +69,7 @@ pub(super) const LTP_GAIN_ICDF_2: [u8; 32] = [
 ];
 pub(super) const LTPSCALE_ICDF: [u8; 3] = [128, 64, 0];
 
-/// Pulse coding tables.
+/// Tablas de los pulsos.
 pub(super) const RATE_LEVELS_ICDF: [[u8; 9]; 2] = [
     [241, 190, 178, 132, 87, 74, 41, 14, 0],
     [223, 193, 157, 140, 106, 57, 39, 18, 0],
@@ -148,28 +150,13 @@ pub(super) const SIGN_ICDF: [u8; 42] = [
     14, 21, 32, 42, 51, 66, 255, 94, 104, 109, 112, 115, 118, 248, 53, 69, 80, 88, 95, 102,
 ];
 
-/// Minimal NLSF entropy codebook fields needed by decode_indices.
-#[derive(Debug, Clone, Copy)]
-pub(super) struct NlsfEntropyCodebook {
-    /// NLSF order.
-    pub order: usize,
-    /// Number of stage-1 vectors.
-    pub n_vectors: usize,
-    /// Stage-1 iCDF table.
-    pub cb1_icdf: &'static [u8],
-    /// Packed selector map (`ec_sel`) for per-dimension stage-2 tables.
-    pub ec_sel: &'static [u8],
-    /// Stage-2 iCDF table bank (`ec_iCDF`).
-    pub ec_icdf: &'static [u8],
-}
-
-/// NB/MB codebook stage-1 iCDF.
+/// iCDF de la etapa 1 del libro NLSF de banda estrecha y media.
 pub(super) const NLSF_CB1_ICDF_NB_MB: [u8; 64] = [
     212, 178, 148, 129, 108, 96, 85, 82, 79, 77, 61, 59, 57, 56, 51, 49, 48, 45, 42, 41, 40, 38,
     36, 34, 31, 30, 21, 12, 10, 3, 1, 0, 255, 245, 244, 236, 233, 225, 217, 203, 190, 176, 175,
     161, 149, 136, 125, 114, 102, 91, 81, 71, 60, 52, 43, 35, 28, 20, 19, 18, 12, 11, 5, 0,
 ];
-/// NB/MB codebook selector map.
+/// Selectores de predictor y de tabla de etapa 2 del libro NLSF de banda estrecha y media.
 pub(super) const NLSF_CB2_SELECT_NB_MB: [u8; 160] = [
     16, 0, 0, 0, 0, 99, 66, 36, 36, 34, 36, 34, 34, 34, 34, 83, 69, 36, 52, 34, 116, 102, 70, 68,
     68, 176, 102, 68, 68, 34, 65, 85, 68, 84, 36, 116, 141, 152, 139, 170, 132, 187, 184, 216, 137,
@@ -180,7 +167,7 @@ pub(super) const NLSF_CB2_SELECT_NB_MB: [u8; 160] = [
     186, 246, 185, 139, 116, 185, 219, 185, 138, 100, 100, 134, 100, 102, 34, 68, 68, 100, 68, 168,
     203, 221, 218, 168, 167, 154, 136, 104, 70, 164, 246, 171, 137, 139, 137, 155, 218, 219, 139,
 ];
-/// NB/MB codebook stage-2 iCDF table bank.
+/// Tablas iCDF de la etapa 2 del libro NLSF de banda estrecha y media.
 pub(super) const NLSF_CB2_ICDF_NB_MB: [u8; 72] = [
     255, 254, 253, 238, 14, 3, 2, 1, 0, 255, 254, 252, 218, 35, 3, 2, 1, 0, 255, 254, 250, 208, 59,
     4, 2, 1, 0, 255, 254, 246, 194, 71, 10, 2, 1, 0, 255, 252, 236, 183, 82, 8, 2, 1, 0, 255, 252,
@@ -188,13 +175,13 @@ pub(super) const NLSF_CB2_ICDF_NB_MB: [u8; 72] = [
     1, 0,
 ];
 
-/// WB codebook stage-1 iCDF.
+/// iCDF de la etapa 1 del libro NLSF de banda ancha.
 pub(super) const NLSF_CB1_ICDF_WB: [u8; 64] = [
     225, 204, 201, 184, 183, 175, 158, 154, 153, 135, 119, 115, 113, 110, 109, 99, 98, 95, 79, 68,
     52, 50, 48, 45, 43, 32, 31, 27, 18, 10, 3, 0, 255, 251, 235, 230, 212, 201, 196, 182, 167, 166,
     163, 151, 138, 124, 110, 104, 90, 78, 76, 70, 69, 57, 45, 34, 24, 21, 11, 6, 5, 4, 3, 0,
 ];
-/// WB codebook selector map.
+/// Selectores de predictor y de tabla de etapa 2 del libro NLSF de banda ancha.
 pub(super) const NLSF_CB2_SELECT_WB: [u8; 256] = [
     0, 0, 0, 0, 0, 0, 0, 1, 100, 102, 102, 68, 68, 36, 34, 96, 164, 107, 158, 185, 180, 185, 139,
     102, 64, 66, 36, 34, 34, 0, 1, 32, 208, 139, 141, 191, 152, 185, 155, 104, 96, 171, 104, 166,
@@ -209,7 +196,7 @@ pub(super) const NLSF_CB2_SELECT_WB: [u8; 256] = [
     159, 137, 102, 110, 154, 118, 87, 101, 119, 101, 0, 2, 0, 36, 36, 66, 68, 35, 96, 164, 102,
     100, 36, 0, 2, 33, 167, 138, 174, 102, 100, 84, 2, 2, 100, 107, 120, 119, 36, 197, 24, 0,
 ];
-/// WB codebook stage-2 iCDF table bank.
+/// Tablas iCDF de la etapa 2 del libro NLSF de banda ancha.
 pub(super) const NLSF_CB2_ICDF_WB: [u8; 72] = [
     255, 254, 253, 244, 12, 3, 2, 1, 0, 255, 254, 252, 224, 38, 3, 2, 1, 0, 255, 254, 251, 209, 57,
     4, 2, 1, 0, 255, 254, 244, 195, 69, 4, 2, 1, 0, 255, 251, 232, 184, 84, 7, 2, 1, 0, 255, 254,
@@ -217,73 +204,35 @@ pub(super) const NLSF_CB2_ICDF_WB: [u8; 72] = [
     1, 0,
 ];
 
-const NLSF_CODEBOOK_NB_MB: NlsfEntropyCodebook = NlsfEntropyCodebook {
-    order: 10,
-    n_vectors: 32,
-    cb1_icdf: &NLSF_CB1_ICDF_NB_MB,
-    ec_sel: &NLSF_CB2_SELECT_NB_MB,
-    ec_icdf: &NLSF_CB2_ICDF_NB_MB,
-};
+/// Campos de cada byte de `ec_sel`, que describe un par de coeficientes (`silk_NLSF_unpack`):
+/// el bit 0 y el bit 4 eligen el predictor del primero y del segundo; los bits 1–3 y 5–7, la fila
+/// de su ICDF de etapa 2.
+pub(super) const NLSF_EC_SEL_PRED_SHIFTS: [u8; 2] = [0, 4];
+pub(super) const NLSF_EC_SEL_ROW_SHIFTS: [u8; 2] = [1, 5];
+pub(super) const NLSF_EC_SEL_ROW_MASK: u8 = 0x07;
 
-const NLSF_CODEBOOK_WB: NlsfEntropyCodebook = NlsfEntropyCodebook {
-    order: 16,
-    n_vectors: 32,
-    cb1_icdf: &NLSF_CB1_ICDF_WB,
-    ec_sel: &NLSF_CB2_SELECT_WB,
-    ec_icdf: &NLSF_CB2_ICDF_WB,
-};
-
-/// Pick NLSF entropy codebook for internal SILK rate.
-///
-/// Params: `fs_khz` internal SILK sample rate (8/12/16).
-/// Returns: NB/MB codebook for 8/12 and WB codebook for 16 kHz.
-pub(super) fn nlsf_codebook(fs_khz: u32) -> &'static NlsfEntropyCodebook {
-    if fs_khz == 16 {
-        &NLSF_CODEBOOK_WB
-    } else {
-        &NLSF_CODEBOOK_NB_MB
-    }
-}
-
-/// Pick pitch low-bits iCDF for given internal SILK rate.
-///
-/// Params: `fs_khz` internal SILK sample rate (8/12/16).
-/// Returns: corresponding uniform iCDF table.
+/// Tabla uniforme de los bits bajos del lag de tono para la frecuencia interna `fs_khz`: de 8
+/// símbolos a 16 kHz, de 6 a 12 kHz y de 4 en los demás casos.
 pub(super) fn pitch_lag_low_bits_icdf(fs_khz: u32) -> &'static [u8] {
     match fs_khz {
-        16 => &UNIFORM8_ICDF,
-        12 => &UNIFORM6_ICDF,
+        super::tables::FS_KHZ_WB => &UNIFORM8_ICDF,
+        super::tables::FS_KHZ_MB => &UNIFORM6_ICDF,
         _ => &UNIFORM4_ICDF,
     }
 }
 
-/// Pick pitch contour iCDF by bandwidth and subframe count.
-///
-/// Params: `fs_khz` internal SILK sample rate and `nb_subfr` (2 or 4).
-/// Returns: contour iCDF table used by decode_indices.
+/// iCDF del contorno de tono para la frecuencia interna `fs_khz` y `nb_subfr` subtramas (2 o 4):
+/// hay tablas propias de banda estrecha y de tramas de 10 ms.
 pub(super) fn pitch_contour_icdf(fs_khz: u32, nb_subfr: usize) -> &'static [u8] {
-    if fs_khz == 8 {
-        if nb_subfr == 4 {
+    if fs_khz == super::tables::FS_KHZ_NB {
+        if nb_subfr == super::tables::MAX_NB_SUBFR {
             &PITCH_CONTOUR_NB_ICDF
         } else {
             &PITCH_CONTOUR_10MS_NB_ICDF
         }
-    } else if nb_subfr == 4 {
+    } else if nb_subfr == super::tables::MAX_NB_SUBFR {
         &PITCH_CONTOUR_ICDF
     } else {
         &PITCH_CONTOUR_10MS_ICDF
-    }
-}
-
-/// Pick LTP gain iCDF table by PER index.
-///
-/// Params: `per_index` decoded LTP periodicity class.
-/// Returns: iCDF table for that class, or `None` when out of range.
-pub(super) fn ltp_gain_icdf(per_index: usize) -> Option<&'static [u8]> {
-    match per_index {
-        0 => Some(&LTP_GAIN_ICDF_0),
-        1 => Some(&LTP_GAIN_ICDF_1),
-        2 => Some(&LTP_GAIN_ICDF_2),
-        _ => None,
     }
 }

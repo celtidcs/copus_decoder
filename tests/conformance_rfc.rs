@@ -1,13 +1,11 @@
-#![allow(unused_variables, unused_assignments, clippy::collapsible_if)]
-
-#[path = "../src/compare.rs"]
+mod common;
 mod compare;
 
 use std::fs;
-use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 
-use opus_decoder::{OpusDecoder, OpusError};
+use common::{read_opus_demo_records, vectors_dir};
+use copus_decoder::{OpusDecoder, OpusError};
 
 #[derive(Debug)]
 struct Vector {
@@ -18,28 +16,16 @@ struct Vector {
     channels: u8,
 }
 
-#[derive(Debug)]
-struct OpusDemoPacket {
-    /// `None` means "lost packet" (PLC).
-    packet: Option<Vec<u8>>,
-    /// Expected final range coder value from the reference stream.
-    ///
-    expected_final_range: u32,
-}
-
 #[test]
-#[ignore = "requires OPUS_TESTVECTORS_DIR + vectors.txt + working decoder"]
+#[ignore = "necesita los vectores de RFC 8251 (OPUS_TESTVECTORS_DIR o la carpeta por defecto)"]
 fn rfc_conformance_vectors() {
     let vectors_dir = vectors_dir();
     let manifest_path = vectors_dir.join("vectors.txt");
     let vectors = load_manifest(&manifest_path).unwrap_or_else(|e| {
         panic!(
             "failed to load manifest {}: {e}\n\n\
-             Create it based on {}\n",
+             Créalo con documentacion/infraestructura/preparar-entorno.ps1 o .sh\n",
             manifest_path.display(),
-            Path::new(env!("CARGO_MANIFEST_DIR"))
-                .join("../../testdata/vectors.example.txt")
-                .display()
         )
     });
 
@@ -70,15 +56,13 @@ fn rfc_conformance_vectors() {
     }
 }
 
-/// Exercise public PLC entry points on a CELT vector without asserting bit-exact output.
-///
-/// Params: none.
-/// Returns: nothing; panics on invalid PLC behavior.
+/// Recorre las entradas públicas de ocultación de pérdidas con un vector CELT, sin exigir una
+/// salida exacta bit a bit.
 #[test]
 #[ignore = "manual PLC smoke test"]
 fn plc_smoke_test() {
     let celt_path = vectors_dir().join("testvector07.bit");
-    let celt_packets = read_opus_demo_stream(&celt_path).expect("failed to read testvector07.bit");
+    let celt_packets = read_opus_demo_records(&celt_path).expect("failed to read testvector07.bit");
     let celt_payloads: Vec<&[u8]> = celt_packets
         .iter()
         .filter_map(|packet| packet.packet.as_deref())
@@ -153,7 +137,7 @@ fn plc_smoke_test() {
     }
 
     let silk_path = vectors_dir().join("testvector02.bit");
-    let silk_packets = read_opus_demo_stream(&silk_path).expect("failed to read testvector02.bit");
+    let silk_packets = read_opus_demo_records(&silk_path).expect("failed to read testvector02.bit");
     let silk_payloads: Vec<&[u8]> = silk_packets
         .iter()
         .filter_map(|packet| packet.packet.as_deref())
@@ -236,10 +220,7 @@ fn plc_smoke_test() {
     }
 }
 
-/// Compute root-mean-square amplitude for one floating PCM frame.
-///
-/// Params: decoded floating-point `frame`.
-/// Returns: RMS amplitude as `f64`.
+/// Amplitud cuadrática media (RMS) de una trama PCM en coma flotante.
 fn frame_rms_f32(frame: &[f32]) -> f64 {
     if frame.is_empty() {
         return 0.0;
@@ -259,7 +240,7 @@ fn run_vector(vectors_dir: &Path, v: &Vector) -> Result<(), Box<dyn std::error::
     let bit_path = vectors_dir.join(&v.bit);
     let dec_path = vectors_dir.join(&v.dec);
 
-    let packets = read_opus_demo_stream(&bit_path)?;
+    let packets = read_opus_demo_records(&bit_path)?;
     let expected_pcm = load_pcm16le(&dec_path)?;
     let alt_pcm: Option<Vec<i16>> = alt_dec_path(&dec_path)
         .filter(|p| p.is_file())
@@ -271,19 +252,6 @@ fn run_vector(vectors_dir: &Path, v: &Vector) -> Result<(), Box<dyn std::error::
     let mut got_pcm = Vec::<i16>::new();
     let mut packet_end_samples = Vec::<usize>::new();
     let mut final_range_mismatches: Vec<(usize, u32, u32)> = Vec::new();
-    let dump_got_pcm = std::env::var("OPUS_DUMP_GOT_PCM").ok().as_deref() == Some("1");
-    let trace_packet_idx = std::env::var("OPUS_TRACE_PACKET_IDX")
-        .ok()
-        .and_then(|s| s.parse::<usize>().ok());
-    let trace_pkt0_pcm8 = std::env::var("OPUS_TRACE_PKT0_PCM8").ok().as_deref() == Some("1");
-    let trace_pcm_packet_idx = std::env::var("OPUS_TRACE_PCM_PACKET_IDX")
-        .ok()
-        .and_then(|s| s.parse::<usize>().ok());
-    let trace_first10 = std::env::var("OPUS_TRACE_FIRST10").ok().as_deref() == Some("1");
-    let trace_match_all = std::env::var("OPUS_TRACE_MATCH_ALL").ok().as_deref() == Some("1");
-    let trace_pcm_1_10 = std::env::var("OPUS_TRACE_PCM_1_10").ok().as_deref() == Some("1");
-    let trace_packet_max_delta =
-        std::env::var("OPUS_TRACE_PACKET_MAX_DELTA").ok().as_deref() == Some("1");
 
     for (packet_idx, p) in packets.into_iter().enumerate() {
         let packet = p.packet.as_deref().unwrap_or(&[]);
@@ -294,105 +262,17 @@ fn run_vector(vectors_dir: &Path, v: &Vector) -> Result<(), Box<dyn std::error::
                 got_pcm.extend_from_slice(&out[..written]);
                 let pkt_end = got_pcm.len();
                 packet_end_samples.push(pkt_end);
-                let expected_debug_len = expected_pcm.len() / (v.channels as usize);
-                if pkt_start < expected_debug_len {
-                    let compare_end = pkt_end.min(expected_debug_len);
-                    let mut max_delta = 0i32;
-                    let mut first_diff_idx: isize = -1;
-                    let mut first_diff_delta = 0i32;
-                    let mut first_expected = 0i16;
-                    let mut first_got = 0i16;
-                    let mut max_diff_idx: isize = -1;
-                    let mut max_diff_delta = 0i32;
-                    let mut max_expected = 0i16;
-                    let mut max_got = 0i16;
-                    for i in pkt_start..compare_end {
-                        let expected_i16 = expected_pcm[i];
-                        let delta = got_pcm[i] as i32 - expected_i16 as i32;
-                        let abs_delta = delta.abs();
-                        if abs_delta > max_delta {
-                            max_delta = abs_delta;
-                            max_diff_idx = i as isize;
-                            max_diff_delta = delta;
-                            max_expected = expected_i16;
-                            max_got = got_pcm[i];
-                        }
-                        if first_diff_idx == -1 && delta != 0 {
-                            first_diff_idx = i as isize;
-                            first_diff_delta = delta;
-                            first_expected = expected_i16;
-                            first_got = got_pcm[i];
-                        }
-                    }
+                let expected_len = expected_pcm.len() / (v.channels as usize);
+                if pkt_start < expected_len {
+                    let compare_end = pkt_end.min(expected_len);
+                    let max_delta = (pkt_start..compare_end)
+                        .map(|i| (got_pcm[i] as i32 - expected_pcm[i] as i32).abs())
+                        .max()
+                        .unwrap_or(0);
                     if max_delta > 50 {
                         eprintln!(
                             "DELTA pkt {} max_delta={} frame_size={} sample_range={}..{}",
                             packet_idx, max_delta, written, pkt_start, pkt_end
-                        );
-                    }
-                    if should_trace_debug_packet(packet_idx) || max_delta > 500 {
-                        let mut got_start8_csv = String::new();
-                        let mut exp_start8_csv = String::new();
-                        for i in pkt_start..(pkt_start + 8).min(compare_end) {
-                            if !got_start8_csv.is_empty() {
-                                got_start8_csv.push(';');
-                                exp_start8_csv.push(';');
-                            }
-                            got_start8_csv.push_str(&got_pcm[i].to_string());
-                            exp_start8_csv.push_str(&expected_pcm[i].to_string());
-                        }
-                        let data = format!(
-                            "{{\"packet_idx\":{},\"frame_size\":{},\"sample_start\":{},\"sample_end\":{},\"max_delta\":{},\"max_diff_idx\":{},\"max_diff_delta\":{},\"max_expected\":{},\"max_got\":{},\"first_diff_idx\":{},\"first_diff_delta\":{},\"first_expected\":{},\"first_got\":{},\"got_start8_csv\":\"{}\",\"exp_start8_csv\":\"{}\"}}",
-                            packet_idx,
-                            written,
-                            pkt_start,
-                            pkt_end,
-                            max_delta,
-                            max_diff_idx,
-                            max_diff_delta,
-                            max_expected,
-                            max_got,
-                            first_diff_idx,
-                            first_diff_delta,
-                            first_expected,
-                            first_got,
-                            got_start8_csv,
-                            exp_start8_csv
-                        );
-                        // #region agent log
-                        append_debug_log(
-                            "run-onset-map-v1",
-                            "H3",
-                            "crates/opus-decoder/tests/conformance_rfc.rs:run_vector",
-                            "packet_delta",
-                            &data,
-                        );
-                        // #endregion
-                    }
-                }
-                if trace_pkt0_pcm8 && packet_idx == 0 && written >= 8 {
-                    eprintln!(
-                        "[RUST] pkt0 pcm[0..8]: {} {} {} {} {} {} {} {}",
-                        out[0], out[1], out[2], out[3], out[4], out[5], out[6], out[7]
-                    );
-                }
-                if let Some(target_pcm_idx) = trace_pcm_packet_idx {
-                    if packet_idx == target_pcm_idx && written >= 8 {
-                        eprintln!(
-                            "[RUST] pkt{} pcm[0..8]: {} {} {} {} {} {} {} {}",
-                            target_pcm_idx,
-                            out[0],
-                            out[1],
-                            out[2],
-                            out[3],
-                            out[4],
-                            out[5],
-                            out[6],
-                            out[7]
-                        );
-                        eprintln!(
-                            "[RUST] pkt{} samples_per_channel={}",
-                            target_pcm_idx, samples_per_channel
                         );
                     }
                 }
@@ -425,43 +305,8 @@ fn run_vector(vectors_dir: &Path, v: &Vector) -> Result<(), Box<dyn std::error::
                         packet_idx, p.expected_final_range, got
                     );
                 }
-                if trace_first10 && packet_idx < 10 {
-                    eprintln!(
-                        "[RUST] packet {}: final_range match={}",
-                        packet_idx,
-                        got == p.expected_final_range
-                    );
-                }
-                if trace_match_all {
-                    eprintln!(
-                        "pkt {} match={} splits={}",
-                        packet_idx,
-                        got == p.expected_final_range,
-                        dec.last_split_count()
-                    );
-                }
                 if got != p.expected_final_range {
                     final_range_mismatches.push((packet_idx, p.expected_final_range, got));
-                }
-                if trace_pcm_1_10 && (1..=10).contains(&packet_idx) && written >= 4 {
-                    eprintln!(
-                        "[RUST] pkt{} transient={} pcm[0..4]: {} {} {} {}",
-                        packet_idx,
-                        dec.last_is_transient(),
-                        out[0],
-                        out[1],
-                        out[2],
-                        out[3]
-                    );
-                }
-                if let Some(target_idx) = trace_packet_idx {
-                    if packet_idx == target_idx {
-                        eprintln!(
-                            "[RUST] packet{} final_range expected=0x{:08x} got=0x{:08x}",
-                            target_idx, p.expected_final_range, got
-                        );
-                        return Ok(());
-                    }
                 }
             }
             Err(OpusError::InternalError) => {
@@ -482,15 +327,7 @@ fn run_vector(vectors_dir: &Path, v: &Vector) -> Result<(), Box<dyn std::error::
         }
     }
 
-    if dump_got_pcm {
-        let mut out_bytes = Vec::with_capacity(got_pcm.len() * 2);
-        for s in &got_pcm {
-            out_bytes.extend_from_slice(&s.to_le_bytes());
-        }
-        fs::write("/tmp/rust_tv07.pcm", out_bytes)?;
-    }
-
-    // Fast path: exact match against either output.
+    // Camino rápido: coincidencia exacta con alguna de las dos salidas de referencia.
     if expected_pcm == got_pcm {
         return Ok(());
     }
@@ -500,178 +337,17 @@ fn run_vector(vectors_dir: &Path, v: &Vector) -> Result<(), Box<dyn std::error::
         }
     }
 
-    // Reference conformance uses `opus_compare` (quality metric), not a
-    // byte-exact PCM match.
+    // La conformidad de referencia usa `opus_compare` (una medida de calidad), no la
+    // coincidencia exacta del PCM.
     if expected_pcm != got_pcm {
         let min_len = expected_pcm.len().min(got_pcm.len());
         let first_diff = (0..min_len).find(|&i| expected_pcm[i] != got_pcm[i]);
         if let Some(sample_idx) = first_diff {
             let packet_idx = packet_end_samples.partition_point(|&end| end <= sample_idx);
-            let mut diff_csv = String::new();
-            let mut logged = 0usize;
-            for i in sample_idx..min_len {
-                if expected_pcm[i] != got_pcm[i] {
-                    if !diff_csv.is_empty() {
-                        diff_csv.push(';');
-                    }
-                    let delta = got_pcm[i] as i32 - expected_pcm[i] as i32;
-                    diff_csv.push_str(&format!("{i}:{}:{}:{delta}", expected_pcm[i], got_pcm[i]));
-                    logged += 1;
-                    if logged == 16 {
-                        break;
-                    }
-                }
-            }
             eprintln!(
                 "[RUST] first_pcm_diff sample={} packet={} expected={} got={}",
                 sample_idx, packet_idx, expected_pcm[sample_idx], got_pcm[sample_idx]
             );
-            // #region agent log
-            if let Ok(mut f) = std::fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open("/Users/tadeusz/Opus/Rasopus/.cursor/debug-bea564.log")
-            {
-                let ts = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map(|d| d.as_millis())
-                    .unwrap_or(0);
-                let line = format!(
-                    "{{\"sessionId\":\"4200c5\",\"runId\":\"run-pcm-first-diff\",\"hypothesisId\":\"H18\",\"location\":\"crates/opus-decoder/tests/conformance_rfc.rs:223\",\"message\":\"first_pcm_diff\",\"data\":{{\"sample_idx\":{},\"packet_idx\":{},\"expected\":{},\"got\":{},\"expected_len\":{},\"got_len\":{},\"first_diffs_csv\":\"{}\"}},\"timestamp\":{}}}\n",
-                    sample_idx,
-                    packet_idx,
-                    expected_pcm[sample_idx],
-                    got_pcm[sample_idx],
-                    expected_pcm.len(),
-                    got_pcm.len(),
-                    diff_csv,
-                    ts
-                );
-                let _ = std::io::Write::write_all(&mut f, line.as_bytes());
-            }
-            // #endregion
-        }
-        let mut top = [(0i32, 0usize); 5];
-        for i in 0..min_len {
-            let d = (got_pcm[i] as i32 - expected_pcm[i] as i32).abs();
-            for slot in 0..5 {
-                if d > top[slot].0 {
-                    for shift in (slot + 1..5).rev() {
-                        top[shift] = top[shift - 1];
-                    }
-                    top[slot] = (d, i);
-                    break;
-                }
-            }
-        }
-        let mut top_csv = String::new();
-        for (d, i) in top {
-            if d == 0 {
-                continue;
-            }
-            if !top_csv.is_empty() {
-                top_csv.push(';');
-            }
-            let packet_idx = packet_end_samples.partition_point(|&end| end <= i);
-            top_csv.push_str(&format!(
-                "{i}:{packet_idx}:{}:{}:{}",
-                expected_pcm[i], got_pcm[i], d
-            ));
-        }
-        // #region agent log
-        if let Ok(mut f) = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open("/Users/tadeusz/Opus/Rasopus/.cursor/debug-bea564.log")
-        {
-            let ts = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_millis())
-                .unwrap_or(0);
-            let line = format!(
-                "{{\"sessionId\":\"4200c5\",\"runId\":\"run-pcm-first-diff\",\"hypothesisId\":\"H28\",\"location\":\"crates/opus-decoder/tests/conformance_rfc.rs:320\",\"message\":\"largest_pcm_deltas\",\"data\":{{\"top_deltas_csv\":\"{}\",\"min_len\":{}}},\"timestamp\":{}}}\n",
-                top_csv, min_len, ts
-            );
-            let _ = std::io::Write::write_all(&mut f, line.as_bytes());
-        }
-        // #endregion
-        if trace_packet_max_delta {
-            let mut range_start = 0usize;
-            for (packet_idx, &packet_end) in packet_end_samples.iter().enumerate() {
-                if range_start >= min_len {
-                    break;
-                }
-                let range_end = packet_end.min(min_len);
-                if range_end <= range_start {
-                    continue;
-                }
-                let mut max_delta = 0i32;
-                let mut sum_sq = 0.0f64;
-                for i in range_start..range_end {
-                    let d = expected_pcm[i] as i32 - got_pcm[i] as i32;
-                    let ad = d.abs();
-                    if ad > max_delta {
-                        max_delta = ad;
-                    }
-                    sum_sq += (d as f64) * (d as f64);
-                }
-                let rms = (sum_sq / (range_end - range_start) as f64).sqrt();
-                if max_delta > 50 {
-                    eprintln!(
-                        "[RUST] pkt{} max_delta={} rms={:.1}",
-                        packet_idx, max_delta, rms
-                    );
-                }
-                range_start = range_end;
-            }
-        }
-    }
-    if let Some(alt_pcm) = &alt_pcm {
-        if *alt_pcm != got_pcm {
-            let min_len = alt_pcm.len().min(got_pcm.len());
-            let first_diff = (0..min_len).find(|&i| alt_pcm[i] != got_pcm[i]);
-            if let Some(sample_idx) = first_diff {
-                let packet_idx = packet_end_samples.partition_point(|&end| end <= sample_idx);
-                let mut diff_csv = String::new();
-                let mut logged = 0usize;
-                for i in sample_idx..min_len {
-                    if alt_pcm[i] != got_pcm[i] {
-                        if !diff_csv.is_empty() {
-                            diff_csv.push(';');
-                        }
-                        let delta = got_pcm[i] as i32 - alt_pcm[i] as i32;
-                        diff_csv.push_str(&format!("{i}:{}:{}:{delta}", alt_pcm[i], got_pcm[i]));
-                        logged += 1;
-                        if logged == 16 {
-                            break;
-                        }
-                    }
-                }
-                // #region agent log
-                if let Ok(mut f) = std::fs::OpenOptions::new()
-                    .create(true)
-                    .append(true)
-                    .open("/Users/tadeusz/Opus/Rasopus/.cursor/debug-bea564.log")
-                {
-                    let ts = std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .map(|d| d.as_millis())
-                        .unwrap_or(0);
-                    let line = format!(
-                        "{{\"sessionId\":\"4200c5\",\"runId\":\"run-pcm-first-diff\",\"hypothesisId\":\"H27\",\"location\":\"crates/opus-decoder/tests/conformance_rfc.rs:271\",\"message\":\"first_pcm_diff_alt\",\"data\":{{\"sample_idx\":{},\"packet_idx\":{},\"alt\":{},\"got\":{},\"alt_len\":{},\"got_len\":{},\"first_diffs_csv\":\"{}\"}},\"timestamp\":{}}}\n",
-                        sample_idx,
-                        packet_idx,
-                        alt_pcm[sample_idx],
-                        got_pcm[sample_idx],
-                        alt_pcm.len(),
-                        got_pcm.len(),
-                        diff_csv,
-                        ts
-                    );
-                    let _ = std::io::Write::write_all(&mut f, line.as_bytes());
-                }
-                // #endregion
-            }
         }
     }
     let q0 = compare::compare_quality(
@@ -712,39 +388,6 @@ fn run_vector(vectors_dir: &Path, v: &Vector) -> Result<(), Box<dyn std::error::
         q0.quality_percent, q0.internal_weighted_error
     )
     .into())
-}
-
-/// Decide whether a packet should emit extra debug logging.
-///
-/// Params: `packet_idx` packet number in the vector stream.
-/// Returns: true when explicit packet tracing is requested.
-fn should_trace_debug_packet(packet_idx: usize) -> bool {
-    std::env::var("OPUS_TRACE_PACKET_IDX")
-        .ok()
-        .and_then(|value| value.parse::<usize>().ok())
-        == Some(packet_idx)
-}
-
-/// Append one JSON debug line to the local trace log.
-///
-/// Params: `run_id`, `hypothesis_id`, `location`, `message`, and JSON `data`.
-/// Returns: nothing; errors are ignored because this is debug-only tracing.
-fn append_debug_log(run_id: &str, hypothesis_id: &str, location: &str, message: &str, data: &str) {
-    if let Ok(mut f) = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open("/Users/tadeusz/Opus/Rasopus/.cursor/debug-bea564.log")
-    {
-        let ts = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_millis())
-            .unwrap_or(0);
-        let line = format!(
-            "{{\"sessionId\":\"4200c5\",\"runId\":\"{}\",\"hypothesisId\":\"{}\",\"location\":\"{}\",\"message\":\"{}\",\"data\":{},\"timestamp\":{}}}\n",
-            run_id, hypothesis_id, location, message, data, ts
-        );
-        let _ = std::io::Write::write_all(&mut f, line.as_bytes());
-    }
 }
 
 fn alt_dec_path(dec_path: &Path) -> Option<PathBuf> {
@@ -799,13 +442,6 @@ fn load_manifest(path: &Path) -> Result<Vec<Vector>, Box<dyn std::error::Error>>
     Ok(out)
 }
 
-fn vectors_dir() -> PathBuf {
-    if let Ok(p) = std::env::var("OPUS_TESTVECTORS_DIR") {
-        return PathBuf::from(p);
-    }
-    PathBuf::from("testdata/opus_testvectors")
-}
-
 fn load_pcm16le(path: &Path) -> Result<Vec<i16>, Box<dyn std::error::Error>> {
     let bytes = fs::read(path)?;
     if bytes.len() % 2 != 0 {
@@ -815,65 +451,5 @@ fn load_pcm16le(path: &Path) -> Result<Vec<i16>, Box<dyn std::error::Error>> {
     for c in bytes.chunks_exact(2) {
         out.push(i16::from_le_bytes([c[0], c[1]]));
     }
-    Ok(out)
-}
-
-fn read_opus_demo_stream(path: &Path) -> io::Result<Vec<OpusDemoPacket>> {
-    let mut f = fs::File::open(path)?;
-    let mut bytes = Vec::new();
-    f.read_to_end(&mut bytes)?;
-
-    // Opus "opus_demo" framing (proprietary): repeating records:
-    // - u32be packet_len
-    // - u32be final_range
-    // - packet bytes (packet_len)
-    //
-    // A packet_len of 0 is used to represent a lost packet (PLC).
-    //
-    // NOTE: This is a best-effort implementation intended for the official
-    // conformance vectors. If we find incompatibilities, adjust to match the
-    // reference `opus_demo.c` format exactly.
-    let mut i = 0usize;
-    let mut out = Vec::new();
-    while i < bytes.len() {
-        if i + 4 > bytes.len() {
-            return Err(io::Error::new(
-                io::ErrorKind::UnexpectedEof,
-                "truncated packet_len",
-            ));
-        }
-        let packet_len =
-            u32::from_be_bytes([bytes[i], bytes[i + 1], bytes[i + 2], bytes[i + 3]]) as usize;
-        i += 4;
-
-        if i + 4 > bytes.len() {
-            return Err(io::Error::new(
-                io::ErrorKind::UnexpectedEof,
-                "truncated final_range",
-            ));
-        }
-        let expected_final_range =
-            u32::from_be_bytes([bytes[i], bytes[i + 1], bytes[i + 2], bytes[i + 3]]);
-        i += 4;
-
-        if i + packet_len > bytes.len() {
-            return Err(io::Error::new(
-                io::ErrorKind::UnexpectedEof,
-                "truncated packet",
-            ));
-        }
-        let packet = if packet_len == 0 {
-            None
-        } else {
-            Some(bytes[i..i + packet_len].to_vec())
-        };
-        i += packet_len;
-
-        out.push(OpusDemoPacket {
-            packet,
-            expected_final_range,
-        });
-    }
-
     Ok(out)
 }

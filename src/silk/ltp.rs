@@ -1,30 +1,71 @@
-//! SILK long-term prediction helpers.
-#![allow(clippy::too_many_arguments)]
+//! Predicción a largo plazo (LTP) de SILK.
 
+use super::entropy_tables::{LTP_GAIN_ICDF_0, LTP_GAIN_ICDF_1, LTP_GAIN_ICDF_2};
+use super::fixed::smlawb;
 use super::tables::{
     LTP_ORDER, LTP_SCALES_Q14, LTP_VQ_0_Q7, LTP_VQ_1_Q7, LTP_VQ_2_Q7, MAX_NB_SUBFR,
 };
 
-/// Decode LTP codebook entries to Q14 taps for each active subframe.
+/// Clase de periodicidad LTP (`PERIndex`, RFC 6716 §4.2.7.6.1).
 ///
-/// Params: `per_index` codebook selector, per-subframe `ltp_indices`, active `nb_subfr`,
-/// and mutable `ltp_scale_q14` output.
-/// Returns: decoded per-subframe LTP taps in Q14.
+/// Elige a la vez la tabla de ganancias con que se decodifican los índices LTP y el libro de
+/// filtros de 8, 16 o 32 entradas del que salen. Solo hay tres clases y el tipo no admite otras,
+/// de modo que elegir el libro no puede fallar.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(super) enum LtpPeriodicity {
+    /// Índice 0: libro de 8 filtros.
+    #[default]
+    Codebook8,
+    /// Índice 1: libro de 16 filtros.
+    Codebook16,
+    /// Índice 2: libro de 32 filtros.
+    Codebook32,
+}
+
+impl LtpPeriodicity {
+    /// Clase del índice decodificado del flujo, o `None` si no es 0, 1 ni 2.
+    pub(super) fn from_index(index: i32) -> Option<Self> {
+        match index {
+            0 => Some(Self::Codebook8),
+            1 => Some(Self::Codebook16),
+            2 => Some(Self::Codebook32),
+            _ => None,
+        }
+    }
+
+    /// iCDF con que se decodifican los índices de filtro LTP de esta clase.
+    pub(super) fn gain_icdf(self) -> &'static [u8] {
+        match self {
+            Self::Codebook8 => &LTP_GAIN_ICDF_0,
+            Self::Codebook16 => &LTP_GAIN_ICDF_1,
+            Self::Codebook32 => &LTP_GAIN_ICDF_2,
+        }
+    }
+
+    /// Libro de filtros LTP de esta clase, en Q7.
+    fn vq_codebook(self) -> &'static [[i8; LTP_ORDER]] {
+        match self {
+            Self::Codebook8 => &LTP_VQ_0_Q7,
+            Self::Codebook16 => &LTP_VQ_1_Q7,
+            Self::Codebook32 => &LTP_VQ_2_Q7,
+        }
+    }
+}
+
+/// Coeficientes LTP en Q14 de las `nb_subfr` subtramas, sacados con `ltp_indices` del libro que
+/// elige `periodicity`, y la escala LTP en Q14 de `ltp_scale_index`.
 pub(super) fn decode_ltp_coeffs(
-    per_index: i8,
+    periodicity: LtpPeriodicity,
     ltp_indices: &[i8; MAX_NB_SUBFR],
     nb_subfr: usize,
     ltp_scale_index: i8,
 ) -> ([[i16; LTP_ORDER]; MAX_NB_SUBFR], i32) {
     let mut coeffs_q14 = [[0i16; LTP_ORDER]; MAX_NB_SUBFR];
-    let ltp_scale_q14 = if per_index >= 0 {
-        LTP_SCALES_Q14[ltp_scale_index as usize] as i32
-    } else {
-        0
-    };
+    let ltp_scale_q14 = LTP_SCALES_Q14[ltp_scale_index as usize] as i32;
+    let codebook = periodicity.vq_codebook();
 
     for k in 0..nb_subfr {
-        let row = codebook_row(per_index, ltp_indices[k] as usize);
+        let row = &codebook[ltp_indices[k] as usize];
         for i in 0..LTP_ORDER {
             coeffs_q14[k][i] = (row[i] as i16) << 7;
         }
@@ -33,11 +74,10 @@ pub(super) fn decode_ltp_coeffs(
     (coeffs_q14, ltp_scale_q14)
 }
 
-/// Apply the 5-tap SILK LTP filter to a subframe.
-///
-/// Params: mutable `pres_q14`, Q14 `exc_q14`, Q14 `ltp_q15` history buffer, write `buf_idx`,
-/// decoded `pitch_lag`, active `subfr_length`, and subframe `ltp_coefs_q14`.
-/// Returns: nothing; `pres_q14` and `ltp_q15` are updated in place.
+/// Aplica a una subtrama de `subfr_length` muestras el filtro LTP de 5 coeficientes
+/// `ltp_coefs_q14`: escribe en `pres_q14` la excitación `exc_q14` más la predicción a partir de
+/// la historia `ltp_q15` (en Q15) retrasada `pitch_lag`. Añade cada residuo a la historia desde
+/// `buf_idx`, que avanza.
 pub(super) fn ltp_filter(
     pres_q14: &mut [i32],
     exc_q14: &[i32],
@@ -46,9 +86,6 @@ pub(super) fn ltp_filter(
     pitch_lag: usize,
     subfr_length: usize,
     ltp_coefs_q14: &[i16; LTP_ORDER],
-    _packet_idx: usize,
-    _frame_idx: usize,
-    _subframe_idx: usize,
 ) {
     let start = *buf_idx - pitch_lag + (LTP_ORDER / 2);
     for i in 0..subfr_length {
@@ -79,28 +116,4 @@ pub(super) fn ltp_filter(
         ltp_q15[*buf_idx] = pres_q14[i] << 1;
         *buf_idx += 1;
     }
-}
-
-/// Select one LTP VQ row from the periodicity codebook.
-///
-/// Params: `per_index` codebook selector and row `index`.
-/// Returns: reference to the codebook row in Q7.
-fn codebook_row(per_index: i8, index: usize) -> &'static [i8; LTP_ORDER] {
-    match per_index {
-        0 => &LTP_VQ_0_Q7[index],
-        1 => &LTP_VQ_1_Q7[index],
-        2 => &LTP_VQ_2_Q7[index],
-        _ => panic!("unsupported LTP periodicity index {per_index}"),
-    }
-}
-
-/// Approximate `a32 + ((b32 * (i16)c32) >> 16)`.
-///
-/// Params: accumulator `a32`, multiplicand `b32`, and signed `c32`.
-/// Returns: accumulated high-word product.
-fn smlawb(a32: i32, b32: i32, c32: i32) -> i32 {
-    let c16 = c32 as i16 as i32;
-    let high = (b32 >> 16) * c16;
-    let low = ((b32 & 0xFFFF) * c16) >> 16;
-    a32.wrapping_add(high).wrapping_add(low)
 }

@@ -1,23 +1,26 @@
-//! SILK fixed-point LPC helpers.
+//! Funciones LPC de coma fija de SILK.
 
-use super::tables::{LSF_COS_TAB, MAX_LPC_ORDER};
+use super::fixed::{inverse32_var_q, rshift_round, rshift_round64, smmul};
+use super::tables::{LSF_COS_TAB, MAX_LPC_ORDER, ONE_Q16};
 
 const QA: usize = 16;
 const INV_PRED_GAIN_QA: usize = 24;
 const MAX_LPC_STABILIZE_ITERATIONS: usize = 16;
 const A_LIMIT_QA24: i32 = 16_773_022;
 const MAX_PREDICTION_POWER_GAIN_INV_Q30: i32 = 107_374;
+/// Respuesta en continua máxima de un filtro estable: 1,0 en Q12 (`LPC_inverse_pred_gain`).
+const MAX_DC_RESPONSE_Q12: i32 = 4096;
+/// Tope del coeficiente máximo en `silk_LPC_fit`: `(silk_int32_MAX >> 14) + silk_int16_MAX`.
+const LPC_FIT_MAX_ABS: i32 = 163_838;
+/// Chirp de partida de `silk_LPC_fit`: `SILK_FIX_CONST(0.999, 16)`.
+const LPC_FIT_CHIRP_START_Q16: i32 = 65_470;
 
-/// Convert NLSF values in Q15 to LPC coefficients in Q12.
-///
-/// Params: mutable `lpc_q12`, stabilized `nlsf_q15`, and LPC `order` (10 or 16).
-/// Returns: nothing; `lpc_q12[..order]` is overwritten.
-pub(super) fn nlsf2a(lpc_q12: &mut [i16], nlsf_q15: &[i16], order: usize) {
-    let ordering = match order {
-        10 => &[0usize, 9, 6, 3, 4, 5, 8, 1, 2, 7][..],
-        16 => &[0usize, 15, 8, 7, 4, 11, 12, 3, 2, 13, 10, 5, 6, 9, 14, 1][..],
-        _ => panic!("unsupported LPC order {order}"),
-    };
+/// Convierte las NLSF estabilizadas `nlsf_q15`, en Q15, en coeficientes LPC en Q12, que escribe
+/// en `lpc_q12[..order]` (`silk_NLSF2A`). `ordering` es el `lpc_ordering` del libro de códigos y
+/// su longitud es el orden LPC. Si el filtro resultante es inestable, se le aplica expansión de
+/// ancho de banda hasta `MAX_LPC_STABILIZE_ITERATIONS` veces.
+pub(super) fn nlsf2a(lpc_q12: &mut [i16], nlsf_q15: &[i16], ordering: &[usize]) {
+    let order = ordering.len();
 
     let mut cos_lsf_qa = [0i32; MAX_LPC_ORDER];
     for k in 0..order {
@@ -49,17 +52,15 @@ pub(super) fn nlsf2a(lpc_q12: &mut [i16], nlsf_q15: &[i16], order: usize) {
         if inv_gain != 0 {
             break;
         }
-        bw_expand_32(&mut a32_qa1[..order], order, 65_536 - (2 << i));
+        bw_expand_32(&mut a32_qa1[..order], order, ONE_Q16 - (2 << i));
         for k in 0..order {
             lpc_q12[k] = rshift_round(a32_qa1[k], QA + 1 - 12) as i16;
         }
     }
 }
 
-/// Compute inverse prediction gain and reject unstable LPC filters.
-///
-/// Params: `lpc_q12` LPC coefficients in Q12 and LPC `order`.
-/// Returns: inverse prediction gain in Q30, or `0` if unstable.
+/// Ganancia de predicción inversa, en Q30, de los coeficientes LPC `lpc_q12` de orden `order`,
+/// en Q12. Devuelve 0 si el filtro es inestable o su respuesta en continua llega al máximo.
 pub(super) fn lpc_inv_pred_gain(lpc_q12: &[i16], order: usize) -> i32 {
     let mut a_tmp_qa = [0i32; MAX_LPC_ORDER];
     let mut dc_resp = 0i32;
@@ -67,37 +68,14 @@ pub(super) fn lpc_inv_pred_gain(lpc_q12: &[i16], order: usize) -> i32 {
         dc_resp += lpc_q12[k] as i32;
         a_tmp_qa[k] = (lpc_q12[k] as i32) << (INV_PRED_GAIN_QA - 12);
     }
-    if dc_resp >= 4096 {
+    if dc_resp >= MAX_DC_RESPONSE_Q12 {
         return 0;
     }
     lpc_inverse_pred_gain_qa(&mut a_tmp_qa[..order], order)
 }
 
-/// Apply Q16 bandwidth expansion to Q12 LPC coefficients.
-///
-/// Params: mutable `lpc_q12`, LPC `order`, and `chirp_q16` factor.
-/// Returns: nothing; coefficients are scaled in place.
-#[allow(dead_code)]
-pub(super) fn bw_expand(lpc_q12: &mut [i16], order: usize, chirp_q16: i32) {
-    let mut chirp_q16_local = chirp_q16;
-    let chirp_minus_one_q16 = chirp_q16_local - 65_536;
-    for coeff in lpc_q12.iter_mut().take(order.saturating_sub(1)) {
-        *coeff = rshift_round(((chirp_q16_local as i64) * (*coeff as i64)) as i32, 16) as i16;
-        chirp_q16_local += rshift_round(
-            ((chirp_q16_local as i64) * (chirp_minus_one_q16 as i64)) as i32,
-            16,
-        );
-    }
-    lpc_q12[order - 1] = rshift_round(
-        ((chirp_q16_local as i64) * (lpc_q12[order - 1] as i64)) as i32,
-        16,
-    ) as i16;
-}
-
-/// Build the even or odd Chebyshev polynomial used by `nlsf2a`.
-///
-/// Params: mutable `out`, interleaved `c_lsf_qa`, and half-order `dd`.
-/// Returns: nothing; `out[..=dd]` is written.
+/// Construye en `out[..=dd]` el polinomio par o impar de `nlsf2a` a partir de los cosenos
+/// entrelazados `c_lsf_qa`, tomados de dos en dos; `dd` es la mitad del orden.
 fn nlsf2a_find_poly(out: &mut [i32; MAX_LPC_ORDER / 2 + 1], c_lsf_qa: &[i32], dd: usize) {
     out[0] = 1 << QA;
     out[1] = -c_lsf_qa[0];
@@ -111,10 +89,9 @@ fn nlsf2a_find_poly(out: &mut [i32; MAX_LPC_ORDER / 2 + 1], c_lsf_qa: &[i32], dd
     }
 }
 
-/// Fit wide intermediate LPC coefficients into `i16` Q12 range.
-///
-/// Params: mutable `lpc_q12`, mutable `a_qin`, output Q `qout`, input Q `qin`, and LPC `order`.
-/// Returns: nothing; `lpc_q12[..order]` receives clipped or chirped coefficients.
+/// Ajusta los coeficientes LPC intermedios `a_qin`, en Q`qin`, al rango de `i16` en Q`qout` y los
+/// escribe en `lpc_q12[..order]` (`silk_LPC_fit`). Prueba hasta 10 expansiones de ancho de banda
+/// sobre `a_qin`; si no bastan, recorta los coeficientes y deja también recortado `a_qin`.
 fn lpc_fit(
     lpc_q12: &mut [i16],
     a_qin: &mut [i32; MAX_LPC_ORDER],
@@ -140,10 +117,10 @@ fn lpc_fit(
             return;
         }
 
-        let capped = shifted.min(163_838);
+        let capped = shifted.min(LPC_FIT_MAX_ABS);
         let numerator = ((capped - i16::MAX as i32) as i64) << 14;
         let denominator = ((capped as i64) * (peak_index as i64 + 1)) >> 2;
-        let chirp_q16 = 65_470 - (numerator / denominator) as i32;
+        let chirp_q16 = LPC_FIT_CHIRP_START_Q16 - (numerator / denominator) as i32;
         bw_expand_32(&mut a_qin[..order], order, chirp_q16);
     }
 
@@ -155,13 +132,11 @@ fn lpc_fit(
     }
 }
 
-/// Apply bandwidth expansion directly to 32-bit LPC intermediates.
-///
-/// Params: mutable `ar_qa1`, LPC `order`, and `chirp_q16` factor.
-/// Returns: nothing; coefficients are chirped in place.
+/// Expansión de ancho de banda sobre los coeficientes intermedios de 32 bits `ar_qa1` de orden
+/// `order`: el coeficiente `k` se multiplica por `chirp_q16` elevado a `k + 1`.
 fn bw_expand_32(ar_qa1: &mut [i32], order: usize, chirp_q16: i32) {
     let mut chirp_q16_local = chirp_q16;
-    let chirp_minus_one_q16 = chirp_q16_local - 65_536;
+    let chirp_minus_one_q16 = chirp_q16_local - ONE_Q16;
     for coeff in ar_qa1.iter_mut().take(order.saturating_sub(1)) {
         *coeff = ((*coeff as i64 * chirp_q16_local as i64) >> 16) as i32;
         chirp_q16_local += rshift_round(
@@ -172,10 +147,9 @@ fn bw_expand_32(ar_qa1: &mut [i32], order: usize, chirp_q16: i32) {
     ar_qa1[order - 1] = ((ar_qa1[order - 1] as i64 * chirp_q16_local as i64) >> 16) as i32;
 }
 
-/// Port of `LPC_inverse_pred_gain_QA_c` for Q24 LPC coefficients.
-///
-/// Params: mutable `a_qa` scratch LPC vector and LPC `order`.
-/// Returns: inverse prediction gain in Q30, or `0` when unstable.
+/// Ganancia de predicción inversa de los coeficientes LPC `a_qa`, en Q24, de orden `order`
+/// (`LPC_inverse_pred_gain_QA_c`). Usa `a_qa` como memoria de trabajo. Devuelve la ganancia en
+/// Q30, o 0 si el filtro es inestable.
 fn lpc_inverse_pred_gain_qa(a_qa: &mut [i32], order: usize) -> i32 {
     let mut inv_gain_q30 = 1 << 30;
     for k in (1..order).rev() {
@@ -218,118 +192,7 @@ fn lpc_inverse_pred_gain_qa(a_qa: &mut [i32], order: usize) -> i32 {
     }
 }
 
-/// Multiply two signed 32-bit values and keep the high 32 bits.
-///
-/// Params: signed `a` and `b`.
-/// Returns: top-word signed product.
-fn smmul(a: i32, b: i32) -> i32 {
-    (((a as i64) * (b as i64)) >> 32) as i32
-}
-
-/// Multiply by a Q-domain fractional value.
-///
-/// Params: signed `a`, signed `b`, and fractional `q`.
-/// Returns: rounded signed product in the original Q-domain.
+/// Producto de `a` por la fracción `b` en Q`q`, redondeado: `(a * b) >> q`.
 fn mul32_frac_q(a: i32, b: i32, q: usize) -> i32 {
     rshift_round64((a as i64) * (b as i64), q)
-}
-
-/// Compute a saturating absolute value for normalization.
-///
-/// Params: signed `value`.
-/// Returns: non-negative magnitude, saturating `i32::MIN`.
-fn abs32_for_clz(value: i32) -> i32 {
-    if value == i32::MIN {
-        i32::MAX
-    } else {
-        value.abs()
-    }
-}
-
-/// Multiply by the signed low 16-bit half of `b32` and keep high word.
-///
-/// Params: signed `a32` and signed `b32`.
-/// Returns: high-word signed product.
-fn smulwb(a32: i32, b32: i32) -> i32 {
-    let b16 = b32 as i16 as i32;
-    let high = (a32 >> 16) * b16;
-    let low = ((a32 & 0xFFFF) * b16) >> 16;
-    high.wrapping_add(low)
-}
-
-/// Approximate `a32 + ((b32 * c32) >> 16)` with wraparound semantics.
-///
-/// Params: accumulator `a32` and signed multiplicands `b32` and `c32`.
-/// Returns: accumulated high-word product.
-fn smlaww(a32: i32, b32: i32, c32: i32) -> i32 {
-    a32.wrapping_add(((b32 as i64 * c32 as i64) >> 16) as i32)
-}
-
-/// Left-shift with saturation.
-///
-/// Params: signed `value` and non-negative `shift`.
-/// Returns: left-shifted value clamped to `i32`.
-fn lshift_sat32(value: i32, shift: usize) -> i32 {
-    if shift >= 31 {
-        if value > 0 {
-            i32::MAX
-        } else if value < 0 {
-            i32::MIN
-        } else {
-            0
-        }
-    } else {
-        value
-            .clamp(i32::MIN >> shift, i32::MAX >> shift)
-            .wrapping_shl(shift as u32)
-    }
-}
-
-/// Approximate `(1 << q_res) / value` in fixed-point.
-///
-/// Params: signed non-zero `value` and target result Q `q_res`.
-/// Returns: fixed-point inverse approximation.
-fn inverse32_var_q(value: i32, q_res: usize) -> i32 {
-    debug_assert!(value != 0);
-    debug_assert!(q_res > 0);
-
-    let b_headrm = abs32_for_clz(value).leading_zeros() as usize - 1;
-    let b32_nrm = value << b_headrm;
-    let b32_inv = (i32::MAX >> 2) / (b32_nrm >> 16);
-    let mut result = b32_inv << 16;
-    let err_q32 = ((1i32 << 29) - smulwb(b32_nrm, b32_inv)) << 3;
-    result = smlaww(result, err_q32, b32_inv);
-
-    let lshift = 61isize - b_headrm as isize - q_res as isize;
-    if lshift <= 0 {
-        lshift_sat32(result, (-lshift) as usize)
-    } else if lshift < 32 {
-        result >> lshift
-    } else {
-        0
-    }
-}
-
-/// Round a signed 32-bit arithmetic right shift.
-///
-/// Params: signed `value` and positive `shift`.
-/// Returns: rounded arithmetic shift result.
-fn rshift_round(value: i32, shift: usize) -> i32 {
-    if shift == 1 {
-        (value >> 1) + (value & 1)
-    } else {
-        ((value >> (shift - 1)) + 1) >> 1
-    }
-}
-
-/// Round a signed 64-bit arithmetic right shift.
-///
-/// Params: signed `value` and positive `shift`.
-/// Returns: rounded arithmetic shift result.
-fn rshift_round64(value: i64, shift: usize) -> i32 {
-    if shift == 1 {
-        ((value >> 1) + (value & 1)) as i32
-    } else {
-        (((value >> (shift - 1)) + 1) >> 1) as i32
-    }
 }

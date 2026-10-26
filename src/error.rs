@@ -1,12 +1,22 @@
+//! Errores internos del decodificador. La API pública los traduce a `OpusError` (`lib.rs`).
+
 use core::fmt;
 
+/// Error interno de cualquier capa del decodificador. Los mensajes de `Display` se conservan en
+/// inglés, como en la versión original.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Error {
+    /// Frecuencia de salida no admitida (las admitidas son 8, 12, 16, 24 y 48 kHz).
     InvalidSampleRate(u32),
+    /// Número de canales no admitido (1 o 2).
     InvalidChannels(u8),
+    /// Paquete mayor que el máximo admitido: `max` bytes, recibidos `got`.
     PacketTooLarge { max: usize, got: usize },
+    /// El búfer de salida no basta: hacían falta `needed` muestras y tiene `got`.
     OutputTooSmall { needed: usize, got: usize },
+    /// Paquete mal formado o incoherente.
     BadPacket,
+    /// Estado interno no previsto (por ejemplo, una configuración que no se decodifica).
     NotImplemented,
 }
 

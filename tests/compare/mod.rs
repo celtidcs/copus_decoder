@@ -8,7 +8,6 @@
 //! still being considered acceptable by the reference test harness.
 
 #![allow(
-    dead_code,
     clippy::too_many_arguments,
     clippy::needless_range_loop,
     clippy::identity_op,

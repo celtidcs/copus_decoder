@@ -1,96 +1,123 @@
-//! SILK tables used by stereo signaling and NLSF/LPC decode.
+//! Constantes y tablas de SILK: estéreo, LBRR, NLSF y LPC, ganancias, tono y LTP.
 
-/// Maximum SILK LPC order.
+/// Mayor orden LPC de SILK.
 pub(super) const MAX_LPC_ORDER: usize = 16;
-/// Maximum number of SILK subframes.
+/// Mayor número de subtramas de una trama interna de SILK.
 pub(super) const MAX_NB_SUBFR: usize = 4;
-/// Maximum SILK subframe length in samples.
+/// Subtramas de una trama SILK de 10 ms: la mitad de `MAX_NB_SUBFR` (RFC 6716 §4.2.2).
+pub(super) const NB_SUBFR_10MS: usize = MAX_NB_SUBFR / 2;
+/// Duración de una subtrama SILK en milisegundos (`SUB_FRAME_LENGTH_MS` en libopus).
+pub(super) const SUB_FRAME_LENGTH_MS: usize = 5;
+/// Frecuencias internas de SILK en kHz: banda estrecha, media y ancha (RFC 6716 §4.2.1).
+pub(super) const FS_KHZ_NB: u32 = 8;
+pub(super) const FS_KHZ_MB: u32 = 12;
+pub(super) const FS_KHZ_WB: u32 = 16;
+/// Hercios por kilohercio, para pasar de la frecuencia en Hz a la de SILK en kHz.
+pub(super) const HZ_PER_KHZ: u32 = 1000;
+/// Tipo de señal sonora (`TYPE_VOICED` en libopus): la única con pitch y LTP.
+pub(super) const TYPE_VOICED: i32 = 2;
+/// Bits de precisión de todas las ICDF de SILK: libopus llama siempre `ec_dec_icdf(..., 8)`.
+pub(super) const ICDF_FTB: u32 = 8;
+/// Factor de interpolación de NLSF que equivale a no interpolar: 1,0 en Q2. Es el valor de las
+/// tramas de 10 ms y de la primera tras un reinicio (`NLSFInterpCoef_Q2 = 4` en libopus).
+pub(super) const NLSF_INTERP_NONE_Q2: i8 = 4;
+/// 1,0 en Q16 (`SILK_FIX_CONST(1, 16)`).
+pub(super) const ONE_Q16: i32 = 65_536;
+/// Mayor longitud de una subtrama de SILK, en muestras.
 pub(super) const MAX_SUB_FRAME_LENGTH: usize = 80;
-/// Maximum SILK frame length in samples.
+/// Mayor longitud de una trama interna de SILK, en muestras.
 pub(super) const MAX_FRAME_LENGTH: usize = 320;
-/// LTP filter order.
+/// Orden del filtro LTP.
 pub(super) const LTP_ORDER: usize = 5;
-/// LTP memory in milliseconds.
+/// Longitud de la memoria LTP, en milisegundos.
 pub(super) const LTP_MEM_LENGTH_MS: usize = 20;
-/// Minimum pitch lag in milliseconds.
+/// Menor lag de tono, en milisegundos.
 pub(super) const PITCH_EST_MIN_LAG_MS: i32 = 2;
-/// Maximum pitch lag in milliseconds.
+/// Mayor lag de tono, en milisegundos.
 pub(super) const PITCH_EST_MAX_LAG_MS: i32 = 18;
-/// Maximum number of stage-2 contour codebooks.
+/// Mayor número de contornos de tono de la etapa 2.
 pub(super) const PE_NB_CBKS_STAGE2_EXT: usize = 11;
-/// Maximum number of stage-3 contour codebooks.
+/// Mayor número de contornos de tono de la etapa 3.
 pub(super) const PE_NB_CBKS_STAGE3_MAX: usize = 34;
-/// Number of stage-3 contour codebooks for 10 ms.
+/// Número de contornos de tono de la etapa 3 en tramas de 10 ms.
 pub(super) const PE_NB_CBKS_STAGE3_10MS: usize = 12;
-/// Number of stage-2 contour codebooks for 10 ms.
+/// Número de contornos de tono de la etapa 2 en tramas de 10 ms.
 pub(super) const PE_NB_CBKS_STAGE2_10MS: usize = 3;
-/// Quantization level adjustment in Q10.
+/// Ajuste del nivel de cuantificación de los pulsos, en Q10.
 pub(super) const QUANT_LEVEL_ADJUST_Q10: i32 = 80;
-/// Unvoiced low quantization offset in Q10.
+/// Desplazamiento bajo del cuantificador en tramas no sonoras, en Q10.
 pub(super) const OFFSET_UVL_Q10: i32 = 100;
-/// Unvoiced high quantization offset in Q10.
+/// Desplazamiento alto del cuantificador en tramas no sonoras, en Q10.
 pub(super) const OFFSET_UVH_Q10: i32 = 240;
-/// Voiced low quantization offset in Q10.
+/// Desplazamiento bajo del cuantificador en tramas sonoras, en Q10.
 pub(super) const OFFSET_VL_Q10: i32 = 32;
-/// Voiced high quantization offset in Q10.
+/// Desplazamiento alto del cuantificador en tramas sonoras, en Q10.
 pub(super) const OFFSET_VH_Q10: i32 = 100;
-/// Number of quantized gain levels.
+/// Número de niveles de la ganancia cuantificada.
 pub(super) const N_LEVELS_QGAIN: i32 = 64;
-/// Minimum gain delta index.
+/// Menor incremento del índice de ganancia.
 pub(super) const MIN_DELTA_GAIN_QUANT: i32 = -4;
-/// Maximum gain delta index.
+/// Mayor incremento del índice de ganancia.
 pub(super) const MAX_DELTA_GAIN_QUANT: i32 = 36;
 
-/// Full SILK NLSF codebook descriptor used by NLSF reconstruction.
+/// Libro de códigos NLSF de SILK completo, con el que se reconstruyen las NLSF.
 #[derive(Debug, Clone, Copy)]
 pub(super) struct NlsfCodebook {
-    /// LPC order for the codebook.
+    /// Orden LPC del libro.
     pub order: usize,
-    /// Residual quantization step size in Q16.
+    /// Número de vectores de la etapa 1 (`nVectors`).
+    pub n_vectors: usize,
+    /// ICDF de la etapa 1, una fila de `n_vectors` por clase de señal (`CB1_iCDF`).
+    pub cb1_icdf: &'static [u8],
+    /// Banco de ICDF de la etapa 2 (`ec_iCDF`).
+    pub ec_icdf: &'static [u8],
+    /// Paso de cuantificación de los residuos, en Q16.
     pub quant_step_size_q16: i32,
-    /// Stage-1 centroids in Q8.
+    /// Centroides de la etapa 1, en Q8.
     pub cb1_nlsf_q8: &'static [u8],
-    /// Stage-1 weights in Q9.
+    /// Pesos de la etapa 1, en Q9.
     pub cb1_wght_q9: &'static [i16],
-    /// Predictive residual coefficients in Q8.
+    /// Coeficientes de predicción de los residuos, en Q8.
     pub pred_q8: &'static [u8],
-    /// Packed predictor/entropy selector map.
+    /// Selectores agrupados de predictor y de ICDF de etapa 2.
     pub ec_sel: &'static [u8],
-    /// Minimum deltas used during stabilization in Q15.
+    /// Distancias mínimas de la estabilización, en Q15.
     pub delta_min_q15: &'static [i16],
+    /// Orden en que `nlsf2a` coloca los cosenos de las NLSF (`ordering10`/`ordering16` de
+    /// `silk_NLSF2A` en libopus). Su longitud es el orden LPC del libro.
+    pub lpc_ordering: &'static [usize],
 }
 
-/// Joint iCDF for stereo predictor coarse index (`silk_stereo_pred_joint_iCDF`).
+/// iCDF del índice conjunto de grupo de los dos predictores estéreo
+/// (`silk_stereo_pred_joint_iCDF`).
 pub(super) const STEREO_PRED_JOINT_ICDF: [u8; 25] = [
     249, 247, 246, 245, 244, 234, 210, 202, 201, 200, 197, 174, 82, 59, 56, 55, 54, 46, 22, 12, 11,
     10, 9, 7, 0,
 ];
 
-/// Uniform 3-way iCDF (`silk_uniform3_iCDF`).
+/// iCDF uniforme de 3 símbolos (`silk_uniform3_iCDF`).
 pub(super) const UNIFORM3_ICDF: [u8; 3] = [171, 85, 0];
 
-/// Uniform 5-way iCDF (`silk_uniform5_iCDF`).
+/// iCDF uniforme de 5 símbolos (`silk_uniform5_iCDF`).
 pub(super) const UNIFORM5_ICDF: [u8; 5] = [205, 154, 102, 51, 0];
 
-/// Mid-only stereo flag iCDF (`silk_stereo_only_code_mid_iCDF`).
+/// iCDF del indicador estéreo de solo medio (`silk_stereo_only_code_mid_iCDF`).
 pub(super) const STEREO_ONLY_CODE_MID_ICDF: [u8; 2] = [64, 0];
 
-/// Stereo predictor dequantization table (`silk_stereo_pred_quant_Q13`).
+/// Tabla de decuantificación de los predictores estéreo, en Q13 (`silk_stereo_pred_quant_Q13`).
 pub(super) const STEREO_PRED_QUANT_Q13: [i32; 16] = [
     -13_732, -10_050, -8_266, -7_526, -6_500, -5_000, -2_950, -820, 820, 2_950, 5_000, 6_500,
     7_526, 8_266, 10_050, 13_732,
 ];
 
-/// LBRR-flag iCDF for 2 internal SILK frames (`silk_LBRR_flags_2_iCDF`).
+/// iCDF de los indicadores LBRR con 2 tramas internas (`silk_LBRR_flags_2_iCDF`).
 pub(super) const LBRR_FLAGS_2_ICDF: [u8; 3] = [203, 150, 0];
 
-/// LBRR-flag iCDF for 3 internal SILK frames (`silk_LBRR_flags_3_iCDF`).
+/// iCDF de los indicadores LBRR con 3 tramas internas (`silk_LBRR_flags_3_iCDF`).
 pub(super) const LBRR_FLAGS_3_ICDF: [u8; 7] = [215, 195, 166, 125, 110, 82, 0];
 
-/// Return LBRR iCDF table for given internal frame count.
-///
-/// Params: `internal_frames` is number of 20 ms SILK-internal frames in one Opus frame.
-/// Returns: table slice for 2/3-frame packets, or `None` for unsupported counts.
+/// iCDF de los indicadores LBRR para `internal_frames` tramas internas de 20 ms por trama Opus:
+/// la de 2 o la de 3, o `None` con cualquier otro número.
 pub(super) fn lbrr_flags_icdf(internal_frames: usize) -> Option<&'static [u8]> {
     match internal_frames {
         2 => Some(&LBRR_FLAGS_2_ICDF),
@@ -99,7 +126,8 @@ pub(super) fn lbrr_flags_icdf(internal_frames: usize) -> Option<&'static [u8]> {
     }
 }
 
-/// Piecewise-linear cosine approximation table in Q12.
+/// `2·cos` en Q12 en 129 puntos de 0 a π (de 8192 a -8192), con la que `nlsf2a` lo aproxima
+/// por tramos lineales.
 pub(super) const LSF_COS_TAB: [i16; 129] = [
     8192, 8190, 8182, 8170, 8152, 8130, 8104, 8072, 8034, 7994, 7946, 7896, 7840, 7778, 7714, 7644,
     7568, 7490, 7406, 7318, 7226, 7128, 7026, 6922, 6812, 6698, 6580, 6458, 6332, 6204, 6070, 5934,
@@ -231,38 +259,51 @@ const NLSF_PRED_WB_Q8: [u8; 30] = [
 const NLSF_DELTA_MIN_WB_Q15: [i16; 17] =
     [100, 3, 40, 3, 3, 3, 5, 14, 14, 10, 11, 3, 8, 9, 7, 3, 347];
 
-/// Narrowband/mediumband NLSF codebook.
+/// Ordenación de los cosenos de las NLSF para orden 10 (`ordering10` de `silk_NLSF2A`).
+const LPC_ORDERING_10: [usize; 10] = [0, 9, 6, 3, 4, 5, 8, 1, 2, 7];
+/// Ordenación de los cosenos de las NLSF para orden 16 (`ordering16` de `silk_NLSF2A`).
+const LPC_ORDERING_16: [usize; 16] = [0, 15, 8, 7, 4, 11, 12, 3, 2, 13, 10, 5, 6, 9, 14, 1];
+
+/// Libro NLSF de banda estrecha y media.
 pub(super) const NLSF_CB_NB_MB: NlsfCodebook = NlsfCodebook {
     order: 10,
+    n_vectors: 32,
+    cb1_icdf: &super::entropy_tables::NLSF_CB1_ICDF_NB_MB,
+    ec_icdf: &super::entropy_tables::NLSF_CB2_ICDF_NB_MB,
     quant_step_size_q16: 11_796,
     cb1_nlsf_q8: &NLSF_CB1_NB_MB_Q8,
     cb1_wght_q9: &NLSF_CB1_WGHT_NB_MB_Q9,
     pred_q8: &NLSF_PRED_NB_MB_Q8,
     ec_sel: &super::entropy_tables::NLSF_CB2_SELECT_NB_MB,
     delta_min_q15: &NLSF_DELTA_MIN_NB_MB_Q15,
+    lpc_ordering: &LPC_ORDERING_10,
 };
 
-/// Wideband NLSF codebook.
+/// Libro NLSF de banda ancha.
 pub(super) const NLSF_CB_WB: NlsfCodebook = NlsfCodebook {
     order: 16,
+    n_vectors: 32,
+    cb1_icdf: &super::entropy_tables::NLSF_CB1_ICDF_WB,
+    ec_icdf: &super::entropy_tables::NLSF_CB2_ICDF_WB,
     quant_step_size_q16: 9_830,
     cb1_nlsf_q8: &NLSF_CB1_WB_Q8,
     cb1_wght_q9: &NLSF_CB1_WGHT_WB_Q9,
     pred_q8: &NLSF_PRED_WB_Q8,
     ec_sel: &super::entropy_tables::NLSF_CB2_SELECT_WB,
     delta_min_q15: &NLSF_DELTA_MIN_WB_Q15,
+    lpc_ordering: &LPC_ORDERING_16,
 };
 
-/// Quantization offsets in Q10 indexed by `[signal_type >> 1][quant_offset_type]`.
+/// Desplazamientos del cuantificador en Q10, por `[signal_type >> 1][quant_offset_type]`.
 pub(super) const QUANTIZATION_OFFSETS_Q10: [[i32; 2]; 2] = [
     [OFFSET_UVL_Q10, OFFSET_UVH_Q10],
     [OFFSET_VL_Q10, OFFSET_VH_Q10],
 ];
 
-/// LTP scaling factors in Q14 indexed by `ltp_scale_index`.
+/// Factores de escala LTP en Q14, por `ltp_scale_index`.
 pub(super) const LTP_SCALES_Q14: [i16; 3] = [15_565, 12_288, 8_192];
 
-/// 20 ms pitch contour table for NB stage-2.
+/// Contornos de tono de 20 ms de banda estrecha (etapa 2).
 pub(super) const CB_LAGS_STAGE2_NB: [[i8; PE_NB_CBKS_STAGE2_EXT]; MAX_NB_SUBFR] = [
     [0, 2, -1, -1, -1, 0, 0, 1, 1, 0, 1],
     [0, 1, 0, 0, 0, 0, 0, 1, 0, 0, 0],
@@ -270,7 +311,7 @@ pub(super) const CB_LAGS_STAGE2_NB: [[i8; PE_NB_CBKS_STAGE2_EXT]; MAX_NB_SUBFR] 
     [0, -1, 2, 1, 0, 1, 1, 0, 0, -1, -1],
 ];
 
-/// 20 ms pitch contour table for MB/WB stage-3.
+/// Contornos de tono de 20 ms de banda media y ancha (etapa 3).
 pub(super) const CB_LAGS_STAGE3_WB: [[i8; PE_NB_CBKS_STAGE3_MAX]; MAX_NB_SUBFR] = [
     [
         0, 0, 1, -1, 0, 1, -1, 0, -1, 1, -2, 2, -2, -2, 2, -3, 2, 3, -3, -4, 3, -4, 4, 4, -5, 5,
@@ -290,16 +331,16 @@ pub(super) const CB_LAGS_STAGE3_WB: [[i8; PE_NB_CBKS_STAGE3_MAX]; MAX_NB_SUBFR] 
     ],
 ];
 
-/// 10 ms pitch contour table for NB stage-2.
+/// Contornos de tono de 10 ms de banda estrecha (etapa 2).
 pub(super) const CB_LAGS_STAGE2_10MS_NB: [[i8; PE_NB_CBKS_STAGE2_10MS]; 2] = [[0, 1, 0], [0, 0, 1]];
 
-/// 10 ms pitch contour table for MB/WB stage-3.
+/// Contornos de tono de 10 ms de banda media y ancha (etapa 3).
 pub(super) const CB_LAGS_STAGE3_10MS_WB: [[i8; PE_NB_CBKS_STAGE3_10MS]; 2] = [
     [0, 0, 1, -1, 1, -1, 2, -2, 2, -2, 3, -3],
     [0, 1, 0, 1, -1, 2, -1, 2, -2, 3, -2, 3],
 ];
 
-/// LTP VQ codebook 0 in Q7.
+/// Libro de filtros LTP 0, en Q7.
 pub(super) const LTP_VQ_0_Q7: [[i8; LTP_ORDER]; 8] = [
     [4, 6, 24, 7, 5],
     [0, 0, 2, 0, 0],
@@ -311,7 +352,7 @@ pub(super) const LTP_VQ_0_Q7: [[i8; LTP_ORDER]; 8] = [
     [16, 14, 38, -3, 33],
 ];
 
-/// LTP VQ codebook 1 in Q7.
+/// Libro de filtros LTP 1, en Q7.
 pub(super) const LTP_VQ_1_Q7: [[i8; LTP_ORDER]; 16] = [
     [13, 22, 39, 23, 12],
     [-1, 36, 64, 27, -6],
@@ -331,7 +372,7 @@ pub(super) const LTP_VQ_1_Q7: [[i8; LTP_ORDER]; 16] = [
     [3, -1, 21, 16, 41],
 ];
 
-/// LTP VQ codebook 2 in Q7.
+/// Libro de filtros LTP 2, en Q7.
 pub(super) const LTP_VQ_2_Q7: [[i8; LTP_ORDER]; 32] = [
     [-6, 27, 61, 39, 5],
     [-11, 42, 88, 4, 1],
@@ -367,12 +408,10 @@ pub(super) const LTP_VQ_2_Q7: [[i8; LTP_ORDER]; 32] = [
     [2, 0, 9, 10, 88],
 ];
 
-/// Select the NLSF codebook for the current internal SILK rate.
-///
-/// Params: `fs_khz` is the internal SILK sampling rate in kHz.
-/// Returns: NB/MB codebook for 8/12 kHz or WB codebook for 16 kHz.
+/// Libro NLSF de la frecuencia interna `fs_khz`: el de banda ancha a 16 kHz y el de banda
+/// estrecha y media en los demás casos.
 pub(super) fn nlsf_codebook(fs_khz: u32) -> &'static NlsfCodebook {
-    if fs_khz == 16 {
+    if fs_khz == FS_KHZ_WB {
         &NLSF_CB_WB
     } else {
         &NLSF_CB_NB_MB

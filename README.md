@@ -1,229 +1,148 @@
-# opus-decoder
+# Copus_Decoder — Decodificador Opus en Rust puro, corregido y auditado
 
-[![Crates.io](https://img.shields.io/crates/v/opus-decoder.svg)](https://crates.io/crates/opus-decoder)
-[![Docs.rs](https://docs.rs/opus-decoder/badge.svg)](https://docs.rs/opus-decoder)
-[![CI](https://github.com/tadeuszwojcik/rasopus/actions/workflows/ci.yml/badge.svg)](https://github.com/tadeuszwojcik/rasopus/actions)
-[![RFC 8251](https://img.shields.io/badge/RFC%208251-12%2F12%20conformant-brightgreen)](https://www.rfc-editor.org/rfc/rfc8251)
-[![License](https://img.shields.io/crates/l/opus-decoder.svg)](LICENSE-APACHE)
+**Copus_Decoder** es una copia corregida de [`opus-decoder` 0.1.1](https://crates.io/crates/opus-decoder/0.1.1),
+el decodificador [Opus](https://opus-codec.org/) en Rust puro de Tadeusz Wójcik
+([repositorio original](https://github.com/TadeuszWolfGang/Rusopus)). No es un proyecto nuevo:
+es un **parche** sobre esa versión, seguido de una auditoría de código que no cambia la salida
+del decodificador.
 
-A pure-Rust [Opus](https://opus-codec.org/) decoder with no unsafe code and no
-FFI. Passes all 12 RFC 8251 conformance test vectors.
+## Sobre Celtilander
 
-## Features
+Soy un usuario novel en el mundo de la programación y la IA. He «ayudado a crear» esta app y
+espero que a alguien le pueda servir para algo... sin más.
 
-- **RFC 8251 conformant** — all 12 official test vectors pass `opus_compare`
-- **All Opus modes** — CELT, SILK, and Hybrid (SWB/FB)
-- **All output sample rates** — 8, 12, 16, 24, 48 kHz
-- **Mono and stereo** — including up/downmix
-- **Packet Loss Concealment (PLC)** — CELT fade-out, SILK pitch extrapolation
-- **Multistream** — `OpusMultistreamDecoder` for surround (5.1, 7.1) and call recording
-- **`#![forbid(unsafe_code)]`** — throughout the correctness implementation
-- **No FFI, no C dependencies** — pure Rust
+Lo que no funciona no lo escondo: está escrito en
+[defectos conocidos](https://github.com/celtidcs/copus_decoder/blob/main/documentacion/defectos-conocidos.md). Si encuentras algo que no esté ahí,
+cuéntamelo.
 
-## Quick Start
+Para realizar esta app he montado un sistema colaborativo y de consenso entre ChatGPT Codex,
+Claude Code y Gemini Antigravity. Yo puse la idea y dirigía el proyecto, mientras que ellos
+diseñaban, repartían y verificaban el trabajo. Ningún código fue revisado por el agente que lo
+había escrito, y una vez terminado todo debía ser aprobado por unanimidad. Hasta que no se
+conseguía el consenso, no se daba una tarea por concluida. Cuando por algún motivo no se llegaba
+a un consenso, era yo quien tomaba la decisión final, así que los fallos que pueda haber serán
+más míos que de ellos.
 
-Add to `Cargo.toml`:
+Saludos a todo el mundo.
+
+---
+
+## 1. Por qué existe esta copia
+
+La versión 0.1.1 publicada en crates.io conserva instrumentación de depuración olvidada: 29
+regiones `#region agent log` que abren, en modo de añadir, un archivo de registro: 21 con la ruta
+absoluta `/Users/tadeusz/Opus/Rasopus/.cursor/debug-bea564.log` de la máquina del autor, 1 con
+`/Users/tadeusz/Opus/Rasopus/.cursor/debug-9a4e1c.log` y 7 con la ruta relativa
+`.cursor/debug-bea564.log` (dentro del directorio actual del proceso). Casi todas están detrás de
+guardas constantes y nunca se ejecutan, pero **dos se ejecutan en cada trama CELT**, ambas con la
+primera ruta absoluta: `postfilter_decoded`, siempre; y
+`postfilter_active_but_not_applied_in_rust`, cuando el postfiltro está activo. Si el proceso
+puede escribir en esa ruta, el decodificador escribe en disco sin que nadie se lo pida; si no
+puede, lo intenta y falla en silencio en cada trama. En Windows, una ruta que empieza por un solo
+separador se resuelve en la raíz de la unidad actual
+([Microsoft](https://learn.microsoft.com/es-es/dotnet/standard/io/file-path-formats)).
+
+Se avisó al autor en el [issue #8](https://github.com/TadeuszWolfGang/Rusopus/issues/8).
+
+Esta copia:
+
+1. **Quita las 29 regiones**
+   ([`parches/0001-quitar-registros-de-depuracion.patch`](parches/0001-quitar-registros-de-depuracion.patch)).
+   El decodificador ya no abre ningún archivo.
+2. **Demuestra que la salida no cambia**: los 12 vectores oficiales de RFC 8251 siguen pasando, y
+   una red de 110 huellas de la salida completa (6 combinaciones de frecuencia y canales, pérdida
+   de paquetes, paquetes dañados, salida `i16` y multiflujo) da exactamente lo mismo que la 0.1.1
+   original.
+3. **Audita el código** (sin valores incrustados, refactorización, piezas de una sola
+   responsabilidad y principios SOLID), con esa misma red como garantía de que cada cambio deja
+   la salida idéntica.
+
+El historial de git conserva cada paso por separado —el original intacto, el parche y después la
+auditoría— para que cualquiera pueda compararlos.
+
+---
+
+## 2. Qué hace
+
+Decodifica paquetes Opus (RFC 6716, con las correcciones de RFC 8251) a PCM:
+
+- Modos CELT, SILK e híbrido.
+- Salida a 8, 12, 16, 24 y 48 kHz, mono o estéreo.
+- Ocultación de paquetes perdidos (PLC).
+- Multiflujo (`OpusMultistreamDecoder`): 5.1, 7.1 o varios flujos mono independientes.
+- `#![forbid(unsafe_code)]`, sin FFI ni dependencias de C. Única dependencia: `thiserror`.
+
+No codifica, no lee contenedores (Ogg, WebM), no implementa la corrección de errores en banda
+(FEC) y no usa SIMD.
+
+---
+
+## 3. Uso rápido
 
 ```toml
 [dependencies]
-opus-decoder = "0.1"
+copus_decoder = { git = "https://github.com/celtidcs/copus_decoder" }
 ```
 
-### Decode a single packet
-
 ```rust
-use opus_decoder::{OpusDecoder, OpusError};
+use copus_decoder::{OpusDecoder, OpusError};
 
-fn main() -> Result<(), OpusError> {
-    let mut decoder = OpusDecoder::new(48_000, 2)?; // 48 kHz, stereo
-    
-    let packet: &[u8] = /* your Opus packet bytes */;
-    let mut pcm = vec![0i16; 960 * 2]; // 20 ms at 48 kHz, stereo interleaved
-    
-    let samples = decoder.decode(packet, &mut pcm, false)?;
-    println!("Decoded {} samples per channel", samples);
-    Ok(())
+fn decodificar(paquete: &[u8]) -> Result<usize, OpusError> {
+    let mut decodificador = OpusDecoder::new(48_000, 2)?; // 48 kHz, estéreo
+    let mut pcm = vec![0i16; decodificador.max_frame_size_per_channel() * 2];
+    // Devuelve las muestras decodificadas por canal; un paquete vacío activa la ocultación.
+    decodificador.decode(paquete, &mut pcm, false)
 }
 ```
 
-### Packet Loss Concealment
+La API es la del original con otro nombre de crate (`opus_decoder::` pasa a ser
+`copus_decoder::`). Más detalle en el [manual de uso](documentacion/manual-de-uso.md).
 
-```rust
-// Pass an empty slice to trigger PLC
-let mut pcm = vec![0i16; 960 * 2];
-decoder.decode(&[], &mut pcm, false)?; // generates concealment frame
-```
+---
 
-### Float output
+## 4. Mapa documental
 
-```rust
-let mut pcm_f32 = vec![0f32; 960 * 2];
-decoder.decode_float(packet, &mut pcm_f32, false)?;
-```
+| Documento | Contenido |
+|---|---|
+| [`documentacion/README.md`](documentacion/README.md) | Índice y visión general. |
+| [`documentacion/funcionalidades.md`](documentacion/funcionalidades.md) | Qué decodifica, con qué límites y qué errores devuelve. |
+| [`documentacion/manual-de-uso.md`](documentacion/manual-de-uso.md) | Integración como librería, ocultación de pérdidas y multiflujo. |
+| [`documentacion/arquitectura.md`](documentacion/arquitectura.md) | Módulos, flujo de decodificación y decisiones. |
+| [`documentacion/historial-de-cambios.md`](documentacion/historial-de-cambios.md) | Cambios respecto al original. |
+| [`documentacion/defectos-conocidos.md`](documentacion/defectos-conocidos.md) | Lo que no funciona o no está comprobado. |
+| [`documentacion/infraestructura/`](documentacion/infraestructura/) | Requisitos, guía de clonado y scripts de preparación del entorno. |
 
-### Multistream — call recording (2 speakers → stereo)
+---
 
-```rust
-use opus_decoder::OpusMultistreamDecoder;
-
-// Two independent mono streams → stereo output
-// Left channel: caller (Stream A), Right channel: callee (Stream B)
-let mut decoder = OpusMultistreamDecoder::new(
-    48_000,  // sample rate
-    2,       // output channels
-    2,       // nb_streams
-    0,       // nb_coupled_streams (both mono)
-    &[0, 1], // mapping: stream 0 → L, stream 1 → R
-)?;
-
-let mut pcm = vec![0i16; 960 * 2];
-decoder.decode(&multistream_packet, &mut pcm, false)?;
-```
-
-### Multistream — 5.1 surround
-
-```rust
-let mut decoder = OpusMultistreamDecoder::new(
-    48_000,
-    6,             // 5.1 output channels
-    4,             // 4 streams total
-    2,             // 2 coupled (stereo) streams
-    &[0, 1, 2, 3, 4, 255], // mapping (255 = silence)
-)?;
-```
-
-## API Reference
-
-### `OpusDecoder`
-
-```rust
-impl OpusDecoder {
-    pub fn new(sample_rate: u32, channels: usize) -> Result<Self, OpusError>;
-    pub fn decode(&mut self, packet: &[u8], pcm: &mut [i16], fec: bool) -> Result<usize, OpusError>;
-    pub fn decode_float(&mut self, packet: &[u8], pcm: &mut [f32], fec: bool) -> Result<usize, OpusError>;
-    pub fn reset(&mut self);
-}
-```
-
-`sample_rate` must be one of: `8000`, `12000`, `16000`, `24000`, `48000`.  
-`channels` must be `1` or `2`.  
-`decode` returns the number of samples decoded **per channel**.  
-An empty `packet` or `fec: true` triggers Packet Loss Concealment (PLC).
-
-### `OpusMultistreamDecoder`
-
-```rust
-impl OpusMultistreamDecoder {
-    pub fn new(sample_rate: u32, nb_channels: usize, nb_streams: usize,
-               nb_coupled_streams: usize, mapping: &[u8]) -> Result<Self, OpusError>;
-    pub fn decode(&mut self, packet: &[u8], pcm: &mut [i16], fec: bool) -> Result<usize, OpusError>;
-    pub fn decode_float(&mut self, packet: &[u8], pcm: &mut [f32], fec: bool) -> Result<usize, OpusError>;
-    pub fn reset(&mut self);
-}
-```
-
-`mapping[i] = 255` silences output channel `i`.  
-The first `nb_coupled_streams` streams are stereo-coupled; the rest are mono.
-
-### `OpusError`
-
-```rust
-pub enum OpusError {
-    InvalidPacket,
-    InternalError,
-    BufferTooSmall,
-    InvalidArgument(&'static str),
-}
-```
-
-## Conformance
-
-All 12 RFC 8251 test vectors pass the `opus_compare` quality metric:
-
-| Vector | Description | Result |
-|--------|-------------|--------|
-| tv01 | CELT stereo FB | ✅ PASS |
-| tv02 | SILK NB 8 kHz mono | ✅ PASS |
-| tv03 | SILK MB 12 kHz mono | ✅ PASS |
-| tv04 | SILK WB 16 kHz mono | ✅ PASS |
-| tv05 | Hybrid SWB transitions | ✅ PASS |
-| tv06 | Hybrid FB transitions | ✅ PASS |
-| tv07 | CELT mono FB | ✅ PASS |
-| tv08 | SILK stereo + CELT NB stereo | ✅ PASS |
-| tv09 | SILK→CELT transitions | ✅ PASS |
-| tv10 | CeltOnly + Hybrid mix | ✅ PASS |
-| tv11 | CELT stereo FB | ✅ PASS |
-| tv12 | SILK bandwidth transitions | ✅ PASS |
-
-Run conformance tests locally:
+## 5. Verificación
 
 ```bash
-# Download test vectors
-cargo xtask fetch-vectors
-
-# Run all 12 vectors
-for v in 01 02 03 04 05 06 07 08 09 10 11 12; do
-  OPUS_TESTVECTORS_DIR="testdata/opus_testvectors" \
-  OPUS_VECTOR=testvector${v} \
-  cargo test --release -p opus-decoder rfc_conformance -- --ignored --nocapture \
-    2>&1 | grep -E "PASS|FAIL"
-done
+cargo test --all-features
+cargo clippy --all-targets --all-features -- -D warnings
+cargo fmt --check
+cargo audit
 ```
 
-## Minimum Supported Rust Version (MSRV)
+La conformidad con RFC 8251 y la red de equivalencia necesitan los vectores oficiales (75 MB
+comprimidos; no se incluyen en el repositorio). Los scripts de
+[`documentacion/infraestructura/`](documentacion/infraestructura/) los descargan, comprueban su
+SHA-256 y preparan el manifiesto; la
+[guía de clonado](documentacion/infraestructura/guia-de-clonado.md) explica cómo ejecutar esas
+pruebas.
 
-**Rust 1.85** — enforced in CI.
+---
 
-Uses: `std`, `thiserror`. No nightly features.
+## 6. Licencia y atribución
 
-## Out of Scope
+Copus_Decoder se distribuye bajo la **GNU General Public License v3.0 o posterior**
+([`LICENSE`](LICENSE)).
 
-The following are intentionally **not** implemented in this crate:
-
-- **Encoder** — decoder only
-- **Container parsing** — Ogg/WebM demux belongs in a separate crate
-- **SIMD optimizations** — correctness first; performance is a future phase
-
-## Implementation Notes
-
-This crate is a pure Rust port of libopus based on RFC 6716 and RFC 8251,
-implemented function-by-function and verified against the reference libopus implementation.
-The floating-point decode path is used throughout (matching libopus float semantics).
-
-Internal architecture:
-
-```
-lib.rs                  — public API, mode routing, mode transitions
-├── celt/               — CELT decoder (MDCT, PVQ, band decode, anti-collapse, PLC)
-├── silk/               — SILK decoder (NLSF→LPC, excitation, IIR/FIR resampler, PLC)
-├── multistream.rs      — OpusMultistreamDecoder
-├── entropy.rs          — Range coder (EcDec)
-└── compare.rs          — opus_compare quality metric port
-```
-
-## Known Limitations
-
-- Hybrid mode PLC uses SILK-only concealment (no CELT highband PLC)
-- No fuzz harness yet (planned)
-
-## License
-
-Licensed under either of:
-
-- [Apache License, Version 2.0](LICENSE-APACHE)
-- [MIT License](LICENSE-MIT)
-
-at your option.
-
-This crate ports algorithms from [libopus](https://gitlab.xiph.org/xiph/opus),
-which is licensed under the [BSD 3-Clause License](https://gitlab.xiph.org/xiph/opus/-/blob/master/COPYING).
-
-## Contributing
-
-Conformance is the top priority. Any change must pass all 12 RFC 8251 test vectors
-before merging. Run:
-
-```bash
-cargo test --release -p opus-decoder
-cargo clippy -p opus-decoder --all-targets -- -D warnings
-```
+- El código original es © 2026 Tadeusz Wójcik, con licencia doble MIT o Apache-2.0. Esta copia lo
+  recibe bajo la rama **Apache-2.0**, que la Apache Software Foundation declara compatible con la
+  GPLv3 ([fuente](https://www.apache.org/licenses/GPL-compatibility.html)). Sus textos de licencia
+  se conservan en [`licencias/`](licencias/), y [`AVISO.md`](AVISO.md) indica qué se ha
+  modificado, como exige el apartado 4(b) de la licencia Apache.
+- El original es un port de [libopus](https://gitlab.xiph.org/xiph/opus) (© Xiph.Org y otros,
+  licencia BSD de 3 cláusulas), cuyo aviso se conserva en
+  [`licencias/LIBOPUS-COPYING-BSD-3`](licencias/LIBOPUS-COPYING-BSD-3). Opus está sujeto a las
+  licencias de patentes gratuitas que se citan en ese archivo.

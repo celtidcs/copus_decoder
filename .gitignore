@@ -1,1 +1,21 @@
-/target
+# Rust
+/target/
+**/*.rs.bk
+*.pdb
+
+# Todo lo que no se publica: compilación, temporales, vectores de prueba descargados
+material_secundario/
+
+# Registros y temporales
+*.log
+tmp/
+
+# Sistema operativo
+Thumbs.db
+[Dd]esktop.ini
+.DS_Store
+
+# Editores
+.idea/
+.vscode/
+*.swp

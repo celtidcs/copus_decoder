@@ -1,15 +1,16 @@
-//! SILK NLSF reconstruction helpers.
+//! Reconstrucción de las NLSF de SILK.
 
-use super::tables::{self, MAX_LPC_ORDER, NlsfCodebook};
+use super::entropy_tables::NLSF_EC_SEL_PRED_SHIFTS;
+use super::fixed::rshift_round;
+use super::tables::{MAX_LPC_ORDER, NlsfCodebook};
 
 const MAX_LOOPS: usize = 20;
 const NLSF_QUANT_LEVEL_ADJ_Q10: i32 = 102;
 
-/// Two-stage VQ decode: stage1 codebook plus predictive residuals.
-///
-/// Params: `nlsf_q15` output slice, `nlsf_indices` packed stage1+stage2 indices,
-/// and `codebook` selecting NB/MB or WB tables.
-/// Returns: nothing; `nlsf_q15[..order]` is filled with stabilized Q15 NLSFs.
+/// Decodifica la cuantificación vectorial en dos etapas de las NLSF: el vector de la primera
+/// etapa más los residuos predictivos de la segunda, con los índices agrupados `nlsf_indices` y
+/// el libro `codebook` (de banda estrecha y media o de banda ancha). Escribe en
+/// `nlsf_q15[..order]` las NLSF estabilizadas, en Q15.
 pub(super) fn nlsf_decode(nlsf_q15: &mut [i16], nlsf_indices: &[i8], codebook: &NlsfCodebook) {
     let order = codebook.order;
     debug_assert!(nlsf_q15.len() >= order);
@@ -31,18 +32,16 @@ pub(super) fn nlsf_decode(nlsf_q15: &mut [i16], nlsf_indices: &[i8], codebook: &
     for i in 0..order {
         let weighted_q15 = ((res_q10[i] as i32) << 14) / codebook.cb1_wght_q9[cb_base + i] as i32;
         let centroid_q15 = (codebook.cb1_nlsf_q8[cb_base + i] as i32) << 7;
-        nlsf_q15[i] = (weighted_q15 + centroid_q15).clamp(0, 32_767) as i16;
+        nlsf_q15[i] = (weighted_q15 + centroid_q15).clamp(0, i16::MAX as i32) as i16;
     }
 
-    nlsf_stabilize(nlsf_q15, order);
+    nlsf_stabilize(nlsf_q15, codebook.delta_min_q15, order);
 }
 
-/// Stabilize NLSFs with the canonical SILK minimum-delta constraints.
-///
-/// Params: mutable `nlsf_q15` vector and LPC `order` (10 or 16).
-/// Returns: nothing; the slice is modified in place.
-pub(super) fn nlsf_stabilize(nlsf_q15: &mut [i16], order: usize) {
-    let delta_min_q15 = delta_min_for_order(order);
+/// Estabiliza en el sitio las `order` NLSF de `nlsf_q15` para que respeten las distancias
+/// mínimas `delta_min_q15` del libro (`order + 1` entradas), entre sí y con los extremos. Si
+/// tras `MAX_LOOPS` pasadas no lo consigue, ordena las NLSF y las fuerza a esas distancias.
+pub(super) fn nlsf_stabilize(nlsf_q15: &mut [i16], delta_min_q15: &[i16], order: usize) {
     debug_assert!(nlsf_q15.len() >= order);
 
     for _ in 0..MAX_LOOPS {
@@ -108,26 +107,24 @@ pub(super) fn nlsf_stabilize(nlsf_q15: &mut [i16], order: usize) {
     }
 }
 
-/// Unpack predictor choices from the packed `ec_sel` map.
-///
-/// Params: mutable `pred_q8`, source `codebook`, and stage-1 `cb1_index`.
-/// Returns: nothing; predictor coefficients are written into `pred_q8[..order]`.
+/// Escribe en `pred_q8[..order]` los coeficientes del predictor que eligen los selectores de
+/// `ec_sel` del vector `cb1_index` del libro `codebook`.
 fn unpack_predictors(pred_q8: &mut [u8; MAX_LPC_ORDER], codebook: &NlsfCodebook, cb1_index: usize) {
     let order = codebook.order;
     let base = cb1_index * order / 2;
     let entries = &codebook.ec_sel[base..base + order / 2];
     for i in (0..order).step_by(2) {
         let entry = entries[i / 2];
-        pred_q8[i] = codebook.pred_q8[i + ((entry & 1) as usize) * (order - 1)];
-        pred_q8[i + 1] = codebook.pred_q8[i + (((entry >> 4) & 1) as usize) * (order - 1) + 1];
+        for (j, &shift) in NLSF_EC_SEL_PRED_SHIFTS.iter().enumerate() {
+            let predictor = ((entry >> shift) & 1) as usize;
+            pred_q8[i + j] = codebook.pred_q8[i + predictor * (order - 1) + j];
+        }
     }
 }
 
-/// Reconstruct predictive stage-2 residuals in Q10.
-///
-/// Params: mutable `res_q10`, signed stage-2 `indices`, predictor `pred_q8`,
-/// residual step `quant_step_size_q16`, and LPC `order`.
-/// Returns: nothing; `res_q10[..order]` is filled in reverse predictive order.
+/// Reconstruye en `res_q10[..order]` los residuos de la segunda etapa, en Q10, a partir de los
+/// índices con signo `indices`, el paso `quant_step_size_q16` y el predictor `pred_q8`. Se
+/// recorren del último al primero, porque cada uno se predice a partir del siguiente.
 fn residual_dequant(
     res_q10: &mut [i16; MAX_LPC_ORDER],
     indices: &[i8],
@@ -149,34 +146,7 @@ fn residual_dequant(
     }
 }
 
-/// Return the canonical `deltaMin_Q15` table for a given LPC order.
-///
-/// Params: `order` LPC order.
-/// Returns: matching delta-min table slice.
-fn delta_min_for_order(order: usize) -> &'static [i16] {
-    match order {
-        10 => tables::NLSF_CB_NB_MB.delta_min_q15,
-        16 => tables::NLSF_CB_WB.delta_min_q15,
-        _ => panic!("unsupported LPC order {order}"),
-    }
-}
-
-/// Round an arithmetic right shift like `silk_RSHIFT_ROUND`.
-///
-/// Params: signed `value` and positive `shift`.
-/// Returns: rounded arithmetic right-shift result.
-fn rshift_round(value: i32, shift: usize) -> i32 {
-    if shift == 1 {
-        (value >> 1) + (value & 1)
-    } else {
-        ((value >> (shift - 1)) + 1) >> 1
-    }
-}
-
-/// Clamp a value between two inclusive bounds.
-///
-/// Params: signed `value`, `min_value`, and `max_value`.
-/// Returns: bounded value.
+/// Limita `value` al intervalo cerrado `[min_value, max_value]`.
 fn limit32(value: i32, min_value: i32, max_value: i32) -> i32 {
     value.clamp(min_value, max_value)
 }

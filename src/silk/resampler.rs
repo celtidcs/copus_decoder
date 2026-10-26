@@ -1,49 +1,61 @@
-//! SILK decoder-side resampler for internal-rate PCM to 48 kHz.
+//! Remuestreador de SILK del decodificador: del PCM a la frecuencia interna a 48 kHz.
 
+use super::fixed::smulww;
 use crate::Error;
 
 use super::resampler_private;
+use super::tables::{FS_KHZ_MB, FS_KHZ_NB, FS_KHZ_WB, HZ_PER_KHZ};
 
 const RESAMPLER_MAX_BATCH_SIZE_MS: usize = 10;
-const SILK_RESAMPLER_MAX_IIR_ORDER: usize = 6;
+pub(super) const SILK_RESAMPLER_MAX_IIR_ORDER: usize = 6;
 const SILK_RESAMPLER_MAX_DELAY: usize = 96;
+/// Frecuencia de salida del único camino del decodificador: la de la API, 48 kHz.
+const FS_OUT_48K_HZ: u32 = crate::packet::OPUS_RATE_HZ as u32;
+/// Retardo de entrada hacia 48 kHz desde 8, 12 y 16 kHz: columna de 48 kHz de
+/// `delay_matrix_dec` en `silk_resampler_init`.
+const INPUT_DELAY_TO_48K: [usize; 3] = [0, 4, 7];
 
-/// Decoder-side SILK resampler state.
+/// Estado del remuestreador de SILK del decodificador.
 #[derive(Debug, Clone)]
 pub(super) struct SilkResampler {
-    /// Input sampling rate in Hz.
+    /// Frecuencia de entrada, en Hz.
     fs_in_hz: u32,
-    /// Output sampling rate in Hz.
+    /// Frecuencia de salida, en Hz.
     fs_out_hz: u32,
-    /// Input rate in kHz.
+    /// Frecuencia de entrada, en kHz: muestras de entrada por milisegundo.
     fs_in_khz: usize,
-    /// One-block input batch size.
+    /// Muestras de entrada de cada bloque que se procesa de una vez (10 ms).
     batch_size: usize,
-    /// Ratio step used by the FIR interpolator.
+    /// Paso del interpolador FIR por muestra de salida, en Q16, sobre la señal ya duplicada.
     inv_ratio_q16: i32,
-    /// Decoder-mode delay compensation in samples.
+    /// Retardo de entrada del decodificador, en muestras.
     input_delay: usize,
-    /// IIR/allpass state.
+    /// Estado de los filtros paso todo del duplicador.
     s_iir: [i32; SILK_RESAMPLER_MAX_IIR_ORDER],
-    /// FIR/history state.
+    /// Historia del interpolador FIR.
     s_fir: [i16; resampler_private::fir_history_len()],
-    /// Delay buffer used by the top-level dispatcher.
+    /// Memoria del retardo de entrada, que usa `process`.
     delay_buf: [i16; SILK_RESAMPLER_MAX_DELAY],
 }
 
 impl SilkResampler {
-    /// Create a decoder-mode SILK resampler.
+    /// Crea un remuestreador de la frecuencia interna `fs_in_hz` a la de la API `fs_out_hz`, sin
+    /// estado previo.
     ///
-    /// Params: `fs_in_hz` internal SILK rate and `fs_out_hz` API output rate.
-    /// Returns: initialized resampler state for supported decoder paths.
+    /// # Errores
+    ///
+    /// `NotImplemented` si la entrada no es de 8, 12 o 16 kHz o la salida no es de 48 kHz.
     pub(super) fn new(fs_in_hz: u32, fs_out_hz: u32) -> Result<Self, Error> {
+        const FS_NB_HZ: u32 = FS_KHZ_NB * HZ_PER_KHZ;
+        const FS_MB_HZ: u32 = FS_KHZ_MB * HZ_PER_KHZ;
+        const FS_WB_HZ: u32 = FS_KHZ_WB * HZ_PER_KHZ;
         let input_delay = match (fs_in_hz, fs_out_hz) {
-            (8_000, 48_000) => 0,
-            (12_000, 48_000) => 4,
-            (16_000, 48_000) => 7,
+            (FS_NB_HZ, FS_OUT_48K_HZ) => INPUT_DELAY_TO_48K[0],
+            (FS_MB_HZ, FS_OUT_48K_HZ) => INPUT_DELAY_TO_48K[1],
+            (FS_WB_HZ, FS_OUT_48K_HZ) => INPUT_DELAY_TO_48K[2],
             _ => return Err(Error::NotImplemented),
         };
-        let fs_in_khz = (fs_in_hz / 1000) as usize;
+        let fs_in_khz = (fs_in_hz / HZ_PER_KHZ) as usize;
         let batch_size = fs_in_khz * RESAMPLER_MAX_BATCH_SIZE_MS;
         let mut inv_ratio_q16 = ((((fs_in_hz as i64) << 15) / fs_out_hz as i64) << 2) as i32;
         while smulww(inv_ratio_q16, fs_out_hz as i32) < ((fs_in_hz as i32) << 1) {
@@ -63,18 +75,14 @@ impl SilkResampler {
         })
     }
 
-    /// Check whether the current state matches a rate pair.
-    ///
-    /// Params: `fs_in_hz` and `fs_out_hz`.
-    /// Returns: true when the resampler can be reused as-is.
+    /// Si el remuestreador convierte de `fs_in_hz` a `fs_out_hz` y puede reutilizarse tal cual.
     pub(super) fn matches(&self, fs_in_hz: u32, fs_out_hz: u32) -> bool {
         self.fs_in_hz == fs_in_hz && self.fs_out_hz == fs_out_hz
     }
 
-    /// Resample internal-rate PCM to API-rate PCM.
-    ///
-    /// Params: immutable `input` PCM at internal rate and mutable `output` PCM at API rate.
-    /// Returns: number of output samples written.
+    /// Remuestrea `input`, a la frecuencia interna, en `output`, a la de la API, y devuelve las
+    /// muestras escritas. El primer milisegundo pasa por la memoria del retardo de entrada, que
+    /// al final se rellena con las últimas muestras de `input`.
     pub(super) fn process(&mut self, input: &[i16], output: &mut [i16]) -> usize {
         debug_assert!(input.len() >= self.fs_in_khz);
 
@@ -97,10 +105,9 @@ impl SilkResampler {
         written
     }
 
-    /// Run the IIR+FIR upsampling core on one contiguous input slice.
-    ///
-    /// Params: immutable `input` block and mutable `output` buffer.
-    /// Returns: number of output samples written.
+    /// Sobremuestrea `input` en `output`, en bloques de `batch_size` muestras: duplica la
+    /// frecuencia con los filtros paso todo e interpola con el FIR. Devuelve las muestras
+    /// escritas.
     fn process_iir_fir(&mut self, input: &[i16], output: &mut [i16]) -> usize {
         if input.is_empty() {
             return 0;
@@ -139,19 +146,8 @@ impl SilkResampler {
         total_written
     }
 
-    /// Return the number of output samples for a given input length.
-    ///
-    /// Params: input length in samples.
-    /// Returns: exact output sample count for the configured ratio.
+    /// Muestras de salida que dan `input_len` muestras de entrada con esta pareja de frecuencias.
     pub(super) fn output_len(&self, input_len: usize) -> usize {
         ((input_len as u64) * self.fs_out_hz as u64 / self.fs_in_hz as u64) as usize
     }
-}
-
-/// Approximate signed `((a32 * b32) >> 16)`.
-///
-/// Params: signed `a32` and `b32`.
-/// Returns: signed Q16-scaled product.
-fn smulww(a32: i32, b32: i32) -> i32 {
-    ((a32 as i64 * b32 as i64) >> 16) as i32
 }

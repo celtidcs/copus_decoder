@@ -1,16 +1,22 @@
-//! SILK resampler ROM tables.
+//! Tablas constantes del remuestreador de SILK.
 
-/// FIR interpolation order for upsampling paths.
+/// Orden del FIR de interpolación.
 pub(super) const RESAMPLER_ORDER_FIR_12: usize = 8;
 
-/// High-quality 2x upsampler allpass coefficients, branch 0.
+/// Coeficientes de los filtros paso todo del duplicador de alta calidad, rama 0.
 pub(super) const RESAMPLER_UP2_HQ_0: [i16; 3] = [1746, 14_986, -26_453];
 
-/// High-quality 2x upsampler allpass coefficients, branch 1.
+/// Coeficientes de los filtros paso todo del duplicador de alta calidad, rama 1.
 pub(super) const RESAMPLER_UP2_HQ_1: [i16; 3] = [6854, 25_769, -9994];
 
-/// Fractional FIR interpolation table for the upsampling resampler.
-pub(super) const RESAMPLER_FRAC_FIR_12: [[i16; RESAMPLER_ORDER_FIR_12 / 2]; 12] = [
+/// Fases fraccionarias del FIR de interpolación: 12 posiciones entre dos muestras de entrada
+/// (`silk_resampler_frac_FIR_12`).
+pub(super) const RESAMPLER_FIR_FRACTIONS: usize = 12;
+
+/// Primera mitad de los coeficientes del FIR de interpolación de cada fase; la otra mitad es la
+/// de la fase simétrica, recorrida al revés.
+pub(super) const RESAMPLER_FRAC_FIR_12: [[i16; RESAMPLER_ORDER_FIR_12 / 2];
+    RESAMPLER_FIR_FRACTIONS] = [
     [189, -600, 617, 30_567],
     [117, -159, -1070, 29_704],
     [52, 221, -2392, 28_276],

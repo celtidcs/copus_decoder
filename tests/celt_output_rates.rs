@@ -1,13 +1,11 @@
 mod common;
 
 use common::load_packets;
-use opus_decoder::OpusDecoder;
+use copus_decoder::OpusDecoder;
 
-/// Decode CELT packets successfully at every supported public output rate.
-///
-/// Parameters: none.
-/// Returns: nothing; panics if any supported CELT output rate regresses.
-#[ignore = "requires OPUS_TESTVECTORS_DIR"]
+/// Los paquetes CELT se decodifican en todas las frecuencias de salida admitidas, con las mismas
+/// duraciones que a 48 kHz escaladas a cada frecuencia.
+#[ignore = "necesita los vectores de RFC 8251 (OPUS_TESTVECTORS_DIR o la carpeta por defecto)"]
 #[test]
 fn celt_output_rates_decode_successfully() {
     let packets = load_packets("testvector07").unwrap();
@@ -38,11 +36,9 @@ fn celt_output_rates_decode_successfully() {
     }
 }
 
-/// Conceal CELT loss at a downsampled output rate after warming state.
-///
-/// Parameters: none.
-/// Returns: nothing; panics if PLC regresses for low-rate CELT output.
-#[ignore = "requires OPUS_TESTVECTORS_DIR"]
+/// La ocultación de pérdidas de CELT funciona a una frecuencia de salida reducida, tras
+/// decodificar unos paquetes para tener estado.
+#[ignore = "necesita los vectores de RFC 8251 (OPUS_TESTVECTORS_DIR o la carpeta por defecto)"]
 #[test]
 fn celt_plc_supports_24k_output() {
     let packets = load_packets("testvector07").unwrap();

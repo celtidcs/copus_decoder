@@ -1,57 +1,69 @@
-//! SILK packet loss concealment helpers.
+//! Ocultación de pérdidas de SILK.
 //!
-//! This module stores the subset of libopus PLC state needed by the current
-//! Rust decoder and synthesizes one concealed SILK internal frame at a time.
+//! Guarda de cada trama interna decodificada lo que necesita la ocultación y sintetiza las
+//! tramas internas ocultadas de una en una.
 
+use super::fixed::{add_sat32, rshift_round, sat16, silk_rand, smlawb, smulww};
 use super::tables::{MAX_FRAME_LENGTH, MAX_LPC_ORDER, MAX_NB_SUBFR};
 
-/// Metadata captured from one decoded SILK internal frame for PLC refresh.
+/// Ganancia de ruido inicial: 1,0 en Q14.
+const SHAPE_GAIN_INITIAL_Q14: i32 = 1 << 14;
+/// Atenuación por pérdida consecutiva: la trama `n` sale con `(10 - min(n, 9)) / 10`.
+/// Valor heredado de la 0.1.1; esta ocultación no es la de libopus. **No comprobado**.
+const PLC_ATTENUATION_STEPS: i32 = 10;
+/// Escala del ruido por kHz de la frecuencia interna, en Q10. Heredado; **no comprobado**.
+const PLC_NOISE_SCALE_PER_KHZ: i32 = 3;
+const PLC_NOISE_SCALE_SHIFT: i32 = 10;
+/// Decaimiento de la ganancia de ruido por trama: 0,99 en Q14, el mismo factor que
+/// `PLC_RAND_ATTENUATE_UV_Q15` de libopus. Heredado; **no comprobado**.
+const SHAPE_GAIN_DECAY_Q14: i64 = 16_220;
+
+/// Datos de una trama interna de SILK decodificada con los que se actualiza la ocultación.
 #[derive(Debug, Clone)]
 pub(super) struct SilkDecodedFrame {
-    /// Pitch lag from the last voiced subframe, or zero for unvoiced frames.
+    /// Lag de tono de la última subtrama de una trama sonora, o cero si no es sonora.
     pub lag: i32,
-    /// Collapsed per-subframe pitch gains in Q16.
+    /// Ganancia de tono de cada subtrama, reducida a un valor, en Q16.
     pub ltp_gains: [i32; MAX_NB_SUBFR],
-    /// Synthesized internal-rate PCM for the decoded frame.
+    /// PCM sintetizado de la trama, a la frecuencia interna.
     pub output: Vec<i16>,
 }
 
-/// Mirrors the libopus PLC state needed by the Rust SILK concealment path.
+/// Estado de la ocultación de pérdidas de un canal de SILK. Lo hereda de la 0.1.1 y no es el de
+/// libopus.
 #[derive(Debug, Clone)]
 pub(super) struct SilkPlcState {
-    /// Pitch lag in internal-rate samples from the last good voiced frame.
+    /// Lag de tono de la última trama decodificada, en muestras a la frecuencia interna; cero si
+    /// no era sonora.
     pub pitch_lag: i32,
-    /// Pitch gain per subframe in Q16.
+    /// Ganancia de tono de cada subtrama, en Q16.
     pub pitch_gain: [i32; MAX_NB_SUBFR],
-    /// Saved LPC coefficients in Q12.
+    /// Coeficientes LPC guardados, en Q12.
     pub lpc_coeffs: [i32; MAX_LPC_ORDER],
-    /// Noise-shaping gain in Q14.
+    /// Ganancia del ruido de la excitación, en Q14; decae tras cada trama ocultada.
     pub shape_gain: i32,
-    /// PLC pseudo-random seed.
+    /// Semilla del generador pseudoaleatorio de la ocultación.
     pub rand_seed: i32,
-    /// Last synthesized internal-rate frame for pitch repetition.
+    /// Última trama sintetizada a la frecuencia interna, de la que se repite el tono.
     pub last_frame_out: Vec<i16>,
-    /// Number of active subframes in one concealed internal frame.
+    /// Subtramas de una trama interna ocultada.
     pub nb_subfr: usize,
-    /// Samples per subframe at the internal SILK rate.
+    /// Muestras por subtrama a la frecuencia interna.
     pub subfr_length: usize,
-    /// Internal sampling rate in kHz.
+    /// Frecuencia interna, en kHz.
     pub fs_khz: i32,
-    /// Active LPC order.
+    /// Orden LPC.
     pub nb_coefs: usize,
 }
 
 impl Default for SilkPlcState {
-    /// Create PLC state with stable defaults for the first concealment frame.
-    ///
-    /// Parameters: none.
-    /// Returns: initialized PLC state.
+    /// Estado sin trama previa: todo a cero salvo la ganancia de ruido inicial y la semilla, 1.
     fn default() -> Self {
         Self {
             pitch_lag: 0,
             pitch_gain: [0; MAX_NB_SUBFR],
             lpc_coeffs: [0; MAX_LPC_ORDER],
-            shape_gain: 1 << 14,
+            shape_gain: SHAPE_GAIN_INITIAL_Q14,
             rand_seed: 1,
             last_frame_out: Vec::new(),
             nb_subfr: 0,
@@ -62,11 +74,9 @@ impl Default for SilkPlcState {
     }
 }
 
-/// Save decoded SILK state needed for future PLC synthesis.
-///
-/// Parameters: mutable `plc` state, decoded `frame` metadata, saved `lpc_q12`,
-/// frame layout (`nb_subfr`, `subfr_length`), `fs_khz`, and active `nb_coefs`.
-/// Returns: nothing; `plc` is refreshed from the good frame.
+/// Actualiza `plc` con la trama decodificada `frame`: lag de tono, ganancias acotadas a
+/// `0..=1,0` en Q16, los `nb_coefs` coeficientes LPC de `lpc_q12`, la forma de la trama
+/// (`nb_subfr` subtramas de `subfr_length` muestras), `fs_khz` y el PCM de la trama.
 pub(super) fn plc_update(
     plc: &mut SilkPlcState,
     frame: &SilkDecodedFrame,
@@ -105,11 +115,10 @@ pub(super) fn plc_update(
     plc.last_frame_out.extend_from_slice(&frame.output);
 }
 
-/// Generate one concealed SILK internal frame.
-///
-/// Parameters: mutable `plc` state, mutable LPC synthesis `lpc_state`, mutable
-/// PCM `out`, and packet-level consecutive `loss_count`.
-/// Returns: nothing; `out` contains concealed PCM and state is updated in place.
+/// Sintetiza en `out` una trama interna ocultada: repetición del tono de la última trama más
+/// ruido, por el filtro LPC que parte de la memoria `lpc_state`, atenuado según las pérdidas
+/// consecutivas `loss_count`. Actualiza `lpc_state`, la última trama y la ganancia de ruido de
+/// `plc`. Si el estado no describe una trama o `out` no mide una trama, `out` queda a cero.
 pub(super) fn plc_conceal(
     plc: &mut SilkPlcState,
     lpc_state: &mut [i32],
@@ -126,9 +135,12 @@ pub(super) fn plc_conceal(
     let attenuate_q16 = if loss_count == 0 {
         1 << 16
     } else {
-        ((1 << 16) * (10 - loss_count.min(9)) as i32) / 10
+        let remaining =
+            PLC_ATTENUATION_STEPS - (loss_count.min(PLC_ATTENUATION_STEPS as u32 - 1)) as i32;
+        ((1 << 16) * remaining) / PLC_ATTENUATION_STEPS
     };
-    let base_rand_scale_q16 = (plc.fs_khz.max(1) * 3) << 10;
+    let base_rand_scale_q16 =
+        (plc.fs_khz.max(1) * PLC_NOISE_SCALE_PER_KHZ) << PLC_NOISE_SCALE_SHIFT;
     let noise_gain_q16 = mul_q14_q16(plc.shape_gain, base_rand_scale_q16);
     let mut synth_q14 = [0i32; MAX_LPC_ORDER + MAX_FRAME_LENGTH];
     synth_q14[..nb_coefs].copy_from_slice(&lpc_state[..nb_coefs]);
@@ -139,14 +151,11 @@ pub(super) fn plc_conceal(
         for sample_idx in 0..plc.subfr_length {
             let frame_idx = pitch_offset + sample_idx;
             let pitch_sample = plc_pitch_sample(plc, frame_idx);
-            let mut excitation = mul_q16(pitch_sample, gain_q16);
+            let mut excitation = smulww(pitch_sample, gain_q16);
 
-            plc.rand_seed = plc
-                .rand_seed
-                .wrapping_mul(196_314_165)
-                .wrapping_add(907_633_515);
+            plc.rand_seed = silk_rand(plc.rand_seed);
             let noise = (plc.rand_seed >> 16) as i16 as i32;
-            excitation = excitation.wrapping_add(mul_q16(noise, noise_gain_q16));
+            excitation = excitation.wrapping_add(smulww(noise, noise_gain_q16));
 
             let hist_idx = nb_coefs + frame_idx;
             let mut lpc_pred_q10 = (nb_coefs as i32) >> 1;
@@ -158,8 +167,11 @@ pub(super) fn plc_conceal(
                 );
             }
 
-            let current_q14 = mul_q16(
-                add_sat32(lshift_sat32(excitation, 14), lshift_sat32(lpc_pred_q10, 4)),
+            let current_q14 = smulww(
+                add_sat32(
+                    lshift_sat32_widened(excitation, 14),
+                    lshift_sat32_widened(lpc_pred_q10, 4),
+                ),
                 attenuate_q16,
             );
             synth_q14[hist_idx] = current_q14;
@@ -170,13 +182,12 @@ pub(super) fn plc_conceal(
     lpc_state[..nb_coefs].copy_from_slice(&synth_q14[frame_len..frame_len + nb_coefs]);
     plc.last_frame_out.clear();
     plc.last_frame_out.extend_from_slice(out);
-    plc.shape_gain = ((plc.shape_gain as i64 * 16_220) >> 14) as i32;
+    plc.shape_gain = ((plc.shape_gain as i64 * SHAPE_GAIN_DECAY_Q14) >> 14) as i32;
 }
 
-/// Read one pitch source sample from the saved PLC history.
-///
-/// Parameters: immutable `plc` state and linear `frame_idx` inside the concealed frame.
-/// Returns: previous PCM sample used for pitch repetition, or zero when unavailable.
+/// Muestra de la última trama guardada que repite el tono en la posición `frame_idx` de la trama
+/// ocultada: la de índice `frame_idx - pitch_lag`, con resta con vuelta, módulo la longitud de
+/// la trama guardada. Devuelve cero sin lag o sin trama guardada.
 fn plc_pitch_sample(plc: &SilkPlcState, frame_idx: usize) -> i32 {
     if plc.pitch_lag <= 0 || plc.last_frame_out.is_empty() {
         return 0;
@@ -188,74 +199,16 @@ fn plc_pitch_sample(plc: &SilkPlcState, frame_idx: usize) -> i32 {
     plc.last_frame_out[lag_idx] as i32
 }
 
-/// Multiply a signed sample by a Q16 gain.
-///
-/// Parameters: signed `value` and `gain_q16`.
-/// Returns: scaled signed sample.
-fn mul_q16(value: i32, gain_q16: i32) -> i32 {
-    ((value as i64 * gain_q16 as i64) >> 16) as i32
-}
-
-/// Multiply a Q14 value with a Q16 value and keep Q16 scaling.
-///
-/// Parameters: Q14 `value_q14` and Q16 `value_q16`.
-/// Returns: Q16-scaled product.
+/// Producto de `value_q14`, en Q14, por `value_q16`, en Q16; el resultado queda en Q16.
 fn mul_q14_q16(value_q14: i32, value_q16: i32) -> i32 {
     ((value_q14 as i64 * value_q16 as i64) >> 14) as i32
 }
 
-/// Approximate `a32 + ((b32 * (i16)c32) >> 16)`.
-///
-/// Parameters: accumulator `a32`, multiplicand `b32`, and signed `c32`.
-/// Returns: accumulated high-word product.
-fn smlawb(a32: i32, b32: i32, c32: i32) -> i32 {
-    a32.wrapping_add(smulwb(b32, c32))
-}
-
-/// Multiply by the signed low 16-bit half of `b32` and keep high word.
-///
-/// Parameters: signed `a32` and signed `b32`.
-/// Returns: high-word signed product.
-fn smulwb(a32: i32, b32: i32) -> i32 {
-    let b16 = b32 as i16 as i32;
-    let high = (a32 >> 16) * b16;
-    let low = ((a32 & 0xFFFF) * b16) >> 16;
-    high.wrapping_add(low)
-}
-
-/// Saturating 32-bit addition.
-///
-/// Parameters: signed `a` and `b`.
-/// Returns: saturated sum.
-fn add_sat32(a: i32, b: i32) -> i32 {
-    a.saturating_add(b)
-}
-
-/// Left-shift with saturation.
-///
-/// Parameters: signed `value` and non-negative `shift`.
-/// Returns: saturated left-shifted value.
-fn lshift_sat32(value: i32, shift: usize) -> i32 {
+/// Desplazamiento a la izquierda con saturación, calculado en 64 bits: satura a `i32::MAX` o
+/// `i32::MIN` exactos. **No es** `silk_LSHIFT_SAT32` (`fixed::lshift_sat32`), que limita antes
+/// de desplazar y satura a `(i32::MAX >> shift) << shift`. Heredado de la 0.1.1 en esta
+/// ocultación, que no es la de libopus; unificarlo cambiaría la salida y va aparte.
+fn lshift_sat32_widened(value: i32, shift: usize) -> i32 {
     let widened = (value as i64) << shift;
     widened.clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32
-}
-
-/// Round a signed arithmetic right shift.
-///
-/// Parameters: signed `value` and positive `shift`.
-/// Returns: rounded shifted value.
-fn rshift_round(value: i32, shift: usize) -> i32 {
-    if shift == 1 {
-        (value >> 1) + (value & 1)
-    } else {
-        ((value >> (shift - 1)) + 1) >> 1
-    }
-}
-
-/// Saturate a signed value to `i16`.
-///
-/// Parameters: signed `value`.
-/// Returns: clamped PCM sample.
-fn sat16(value: i32) -> i16 {
-    value.clamp(i16::MIN as i32, i16::MAX as i32) as i16
 }

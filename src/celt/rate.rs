@@ -1,34 +1,48 @@
-//! CELT bit allocation logic (`rate.c`) for decoder path.
-#![allow(clippy::too_many_arguments)]
+//! Asignación de bits de CELT (`rate.c`): reparto del presupuesto de la trama entre bandas y
+//! conversión entre bits y pulsos.
 
 use crate::celt::modes::CeltMode;
 use crate::entropy::EcDec;
 
-const BITRES: i32 = 3;
+use super::{ALLOC_TRIM_DEFAULT, MAX_FINE_BITS};
+use crate::entropy::BITRES;
+
 const FINE_OFFSET: i32 = 21;
-const MAX_FINE_BITS: i32 = 8;
+/// Los índices de pseudopulsos por debajo de 8 son el número de pulsos; desde ahí, 3 bits de
+/// mantisa y el resto de exponente (`get_pulses` de `rate.h`).
+const PSEUDO_PULSE_MANTISSA_BITS: i32 = 3;
+const PSEUDO_PULSE_LINEAR: i32 = 1 << PSEUDO_PULSE_MANTISSA_BITS;
+/// Suma a la tabla de topes antes de escalarla por canales y muestras
+/// (`(m->cache.caps[...]+64)*C*N>>2` en `init_caps`).
+const CAP_OFFSET: i32 = 64;
+/// Umbral mínimo de una banda: 3/16 de bit por muestra (`(3*N<<LM<<BITRES)>>4`).
+const ALLOC_THRESH_NUMERATOR: i32 = 3;
+const ALLOC_THRESH_SHIFT: i32 = 4;
+/// Escala del desplazamiento por recorte (`...*(1<<(LM+BITRES))>>6`).
+const TRIM_OFFSET_SHIFT: i32 = 6;
+/// Bits por canal y muestra bajo los que la energía fina recibe un refuerzo mayor (`den*2`) o
+/// menor (`den*3`) en `interp_bits2pulses`.
+const FINE_BOOST_HIGH_BITS: i32 = 2;
+const FINE_BOOST_LOW_BITS: i32 = 3;
 const ALLOC_STEPS: i32 = 6;
 const LOG2_FRAC_TABLE: [u8; 24] = [
     0, 8, 13, 16, 19, 21, 23, 24, 26, 27, 28, 29, 30, 31, 32, 32, 33, 34, 34, 35, 36, 36, 37, 37,
 ];
 const LOG_MAX_PSEUDO: usize = 6;
 
-/// Convert pseudo-pulse index to real pulse count.
-///
-/// Params: `i` is pseudo index from CELT pulse cache.
-/// Returns: actual pulse count for PVQ decode.
+/// Pulsos que corresponden al pseudoíndice `i` de la caché (`get_pulses`): lineal hasta
+/// `PSEUDO_PULSE_LINEAR` y, desde ahí, en escala logarítmica.
 pub(crate) fn get_pulses(i: i32) -> i32 {
-    if i < 8 {
+    if i < PSEUDO_PULSE_LINEAR {
         i
     } else {
-        (8 + (i & 7)) << ((i >> 3) - 1)
+        (PSEUDO_PULSE_LINEAR + (i & (PSEUDO_PULSE_LINEAR - 1)))
+            << ((i >> PSEUDO_PULSE_MANTISSA_BITS) - 1)
     }
 }
 
-/// Convert allocated bits to pseudo pulse index.
-///
-/// Params: `mode` CELT mode, `band` index, `lm` frame size log2, `bits` in BITRES units.
-/// Returns: pseudo pulse index used by `get_pulses`.
+/// Pseudoíndice de pulsos cuyo coste en la caché de la banda `band` se acerca más a `bits`
+/// (en octavos de bit), por búsqueda binaria (`bits2pulses`).
 pub(crate) fn bits2pulses(mode: &CeltMode, band: usize, lm: i32, bits: i32) -> i32 {
     let lm1 = (lm + 1).max(0) as usize;
     let cache_base = mode.cache.index[lm1 * mode.nb_ebands + band] as usize;
@@ -56,10 +70,7 @@ pub(crate) fn bits2pulses(mode: &CeltMode, band: usize, lm: i32, bits: i32) -> i
     }
 }
 
-/// Convert pseudo pulse index back to spent bits.
-///
-/// Params: `mode` CELT mode, `band` index, `lm` frame size log2, `pulses` pseudo pulse index.
-/// Returns: number of bits in BITRES units spent by this pulse count.
+/// Coste en octavos de bit del pseudoíndice `pulses` en la banda `band` (`pulses2bits`).
 pub(crate) fn pulses2bits(mode: &CeltMode, band: usize, lm: i32, pulses: i32) -> i32 {
     if pulses == 0 {
         return 0;
@@ -70,7 +81,7 @@ pub(crate) fn pulses2bits(mode: &CeltMode, band: usize, lm: i32, pulses: i32) ->
     cache[pulses as usize] as i32 + 1
 }
 
-/// Allocation result arrays produced by CELT `clt_compute_allocation`.
+/// Reparto de bits de una trama, resultado de `clt_compute_allocation`.
 #[derive(Debug, Clone)]
 pub(crate) struct AllocationResult {
     pub coded_bands: usize,
@@ -82,378 +93,540 @@ pub(crate) struct AllocationResult {
     pub fine_priority: Vec<i32>,
 }
 
-/// Initialize CELT per-band bit caps for given `LM` and channel count.
-///
-/// Params: `mode` is CELT mode table, `lm` is frame size log ratio, `channels`
-/// is decode channel count.
-/// Returns: per-band cap values in BITRES units.
+/// Datos de la trama con los que se reparte el presupuesto (argumentos de
+/// `clt_compute_allocation` de libopus).
+pub(crate) struct AllocationRequest<'a> {
+    pub mode: &'a CeltMode,
+    /// Bandas `start..end` que se codifican.
+    pub start: usize,
+    pub end: usize,
+    /// Refuerzos dinámicos por banda, en octavos de bit.
+    pub offsets: &'a [i32],
+    /// Tope de bits por banda (`init_caps`), en octavos de bit.
+    pub cap: &'a [i32],
+    pub alloc_trim: i32,
+    /// Presupuesto disponible, en octavos de bit.
+    pub total: i32,
+    pub channels: usize,
+    pub lm: usize,
+}
+
+/// Tope de bits de cada banda, en octavos de bit, para la duración `lm` y `channels` canales
+/// (`init_caps`: `(caps + 64) * C * N >> 2`).
 pub(crate) fn init_caps(mode: &CeltMode, lm: usize, channels: usize) -> Vec<i32> {
     let mut cap = vec![0i32; mode.nb_ebands];
     for (i, cap_i) in cap.iter_mut().enumerate() {
         let n = ((mode.e_bands[i + 1] - mode.e_bands[i]) as usize) << lm;
         let idx = mode.nb_ebands * (2 * lm + channels - 1) + i;
-        *cap_i = (((mode.cache.caps[idx] as i32) + 64) * channels as i32 * n as i32) >> 2;
+        *cap_i = (((mode.cache.caps[idx] as i32) + CAP_OFFSET) * channels as i32 * n as i32) >> 2;
     }
     cap
 }
 
-/// Compute CELT allocation for one frame (decode path).
-///
-/// Params: `mode` CELT mode, `start..end` active bands, `offsets` dynamic
-/// allocation boosts, `cap` max bits per band, `alloc_trim` trim symbol,
-/// `total` available bits in BITRES units, `channels`, `lm`, and `dec`.
-/// Returns: full allocation result (coded bands, pulses, fine bits, balance).
+/// Reparte el presupuesto de una trama entre sus bandas (`clt_compute_allocation`): elige los dos
+/// vectores de asignación entre los que cabe, interpola entre ellos, decodifica qué bandas se
+/// saltan, la banda de intensidad y el estéreo dual, y separa los bits de energía fina.
 pub(crate) fn clt_compute_allocation(
-    mode: &CeltMode,
-    start: usize,
-    end: usize,
-    offsets: &[i32],
-    cap: &[i32],
-    alloc_trim: i32,
-    total: i32,
-    channels: usize,
-    lm: usize,
+    request: &AllocationRequest<'_>,
     dec: &mut EcDec<'_>,
-    _packet_idx: usize,
 ) -> AllocationResult {
-    let mut total_bits = total.max(0);
-    let skip_rsv = if total_bits >= (1 << BITRES) {
-        1 << BITRES
-    } else {
-        0
-    };
-    total_bits -= skip_rsv;
-
-    let mut intensity_rsv = 0i32;
-    let mut dual_stereo_rsv = 0i32;
-    if channels == 2 {
-        intensity_rsv = LOG2_FRAC_TABLE[end - start] as i32;
-        if intensity_rsv > total_bits {
-            intensity_rsv = 0;
-        } else {
-            total_bits -= intensity_rsv;
-            dual_stereo_rsv = if total_bits >= (1 << BITRES) {
-                1 << BITRES
-            } else {
-                0
-            };
-            total_bits -= dual_stereo_rsv;
-        }
-    }
-
-    let len = mode.nb_ebands;
-    let mut bits1 = vec![0i32; len];
-    let mut bits2 = vec![0i32; len];
-    let mut thresh = vec![0i32; len];
-    let mut trim_offset = vec![0i32; len];
-    let c = channels as i32;
-    for j in start..end {
-        let band_n = (mode.e_bands[j + 1] - mode.e_bands[j]) as i32;
-        thresh[j] = (c << BITRES).max((3 * band_n << lm << BITRES) >> 4);
-        trim_offset[j] = c
-            * band_n
-            * (alloc_trim - 5 - lm as i32)
-            * (end - j - 1) as i32
-            * (1 << (lm as i32 + BITRES))
-            >> 6;
-        if (band_n << lm) == 1 {
-            trim_offset[j] -= c << BITRES;
-        }
-    }
-    let mut lo = 1i32;
-    let mut hi = mode.nb_alloc_vectors as i32 - 1;
-    while lo <= hi {
-        let mut done = false;
-        let mut psum = 0i32;
-        let mid = (lo + hi) >> 1;
-        for j in (start..end).rev() {
-            let n = (mode.e_bands[j + 1] - mode.e_bands[j]) as i32;
-            let mut bits_j =
-                c * n * ((mode.alloc_vectors[mid as usize * len + j] as i32) << lm) >> 2;
-            if bits_j > 0 {
-                bits_j = (bits_j + trim_offset[j]).max(0);
-            }
-            bits_j += offsets[j];
-            if bits_j >= thresh[j] || done {
-                done = true;
-                psum += bits_j.min(cap[j]);
-            } else if bits_j >= c << BITRES {
-                psum += c << BITRES;
-            }
-        }
-        if psum > total_bits {
-            hi = mid - 1;
-        } else {
-            lo = mid + 1;
-        }
-    }
-    hi = lo;
-    lo -= 1;
-
-    let mut skip_start = start;
-    for j in start..end {
-        let n = (mode.e_bands[j + 1] - mode.e_bands[j]) as i32;
-        let mut bits1j = c * n * ((mode.alloc_vectors[lo as usize * len + j] as i32) << lm) >> 2;
-        let mut bits2j = if hi as usize >= mode.nb_alloc_vectors {
-            cap[j]
-        } else {
-            c * n * ((mode.alloc_vectors[hi as usize * len + j] as i32) << lm) >> 2
-        };
-        if bits1j > 0 {
-            bits1j = (bits1j + trim_offset[j]).max(0);
-        }
-        if bits2j > 0 {
-            bits2j = (bits2j + trim_offset[j]).max(0);
-        }
-        if lo > 0 {
-            bits1j += offsets[j];
-        }
-        bits2j += offsets[j];
-        if offsets[j] > 0 {
-            skip_start = j;
-        }
-        bits2j = (bits2j - bits1j).max(0);
-        bits1[j] = bits1j;
-        bits2[j] = bits2j;
-    }
-
-    let mut pulses = vec![0i32; len];
-    let mut fine_quant = vec![0i32; len];
-    let mut fine_priority = vec![0i32; len];
-    let mut intensity = 0i32;
-    let mut dual_stereo = 0i32;
-    let (coded_bands, balance) = interp_bits2pulses(
-        mode,
-        start,
-        end,
-        skip_start,
-        &bits1,
-        &bits2,
-        &thresh,
-        cap,
-        total_bits,
-        skip_rsv,
-        &mut intensity,
-        intensity_rsv,
-        &mut dual_stereo,
-        dual_stereo_rsv,
-        &mut pulses,
-        &mut fine_quant,
-        &mut fine_priority,
-        channels,
-        lm,
-        dec,
-        _packet_idx,
-    );
-
-    AllocationResult {
-        coded_bands,
-        intensity,
-        dual_stereo,
-        balance,
-        pulses,
-        fine_quant,
-        fine_priority,
-    }
+    let reserve = Reservations::new(request.total, request.channels, request.end - request.start);
+    let allocator = Allocator::new(request);
+    let lo = allocator.search_vector(reserve.total_bits);
+    let bounds = allocator.interpolation_bounds(lo);
+    allocator.interp_bits2pulses(&bounds, reserve, dec)
 }
 
-/// Interpolate allocation vectors and derive pulse/fine bit splits.
-///
-/// Params: direct port of libopus `interp_bits2pulses` decoder flow.
-/// Returns: number of coded bands.
-#[allow(clippy::too_many_arguments)]
-fn interp_bits2pulses(
-    mode: &CeltMode,
-    start: usize,
-    end: usize,
-    skip_start: usize,
-    bits1: &[i32],
-    bits2: &[i32],
-    thresh: &[i32],
-    cap: &[i32],
-    total: i32,
-    skip_rsv: i32,
-    intensity: &mut i32,
-    mut intensity_rsv: i32,
-    dual_stereo: &mut i32,
-    mut dual_stereo_rsv: i32,
-    bits: &mut [i32],
-    ebits: &mut [i32],
-    fine_priority: &mut [i32],
-    channels: usize,
-    lm: usize,
-    dec: &mut EcDec<'_>,
-    _packet_idx: usize,
-) -> (usize, i32) {
-    let trace_packet0 = false;
-    let c = channels as i32;
-    let stereo = channels > 1;
-    let alloc_floor = c << BITRES;
-    let log_m = (lm as i32) << BITRES;
+/// Bits apartados antes de repartir: el bit de salto de bandas y, en estéreo, los de la banda de
+/// intensidad y del estéreo dual.
+#[derive(Debug, Clone, Copy)]
+struct Reservations {
+    /// Presupuesto que queda para las bandas.
+    total_bits: i32,
+    skip: i32,
+    intensity: i32,
+    dual_stereo: i32,
+}
 
-    let mut lo = 0i32;
-    let mut hi = 1 << ALLOC_STEPS;
-    for _ in 0..ALLOC_STEPS {
-        let mid = (lo + hi) >> 1;
-        let mut psum = 0i32;
-        let mut done = false;
-        for j in (start..end).rev() {
-            let tmp = bits1[j] + ((mid * bits2[j]) >> ALLOC_STEPS);
-            if tmp >= thresh[j] || done {
-                done = true;
-                psum += tmp.min(cap[j]);
-            } else if tmp >= alloc_floor {
-                psum += alloc_floor;
-            }
-        }
-        if psum > total {
-            hi = mid;
-        } else {
-            lo = mid;
-        }
-    }
-
-    let mut psum = 0i32;
-    let mut done = false;
-    for j in (start..end).rev() {
-        let mut tmp = bits1[j] + ((lo * bits2[j]) >> ALLOC_STEPS);
-        if tmp < thresh[j] && !done {
-            tmp = if tmp >= alloc_floor { alloc_floor } else { 0 };
-        } else {
-            done = true;
-        }
-        tmp = tmp.min(cap[j]);
-        bits[j] = tmp;
-        psum += tmp;
-    }
-
-    let mut coded_bands = end;
-    let mut total_adj = total;
-    loop {
-        let j = coded_bands - 1;
-        if j <= skip_start {
-            // Match libopus: give back reserved skip bit only when skipping loop ends naturally.
-            total_adj += skip_rsv;
-            break;
-        }
-        let left = total - psum;
-        let denom = (mode.e_bands[coded_bands] - mode.e_bands[start]) as i32;
-        let percoeff = if denom > 0 { left / denom } else { 0 };
-        let left_rem = left - denom * percoeff;
-        let rem = (left_rem - (mode.e_bands[j] - mode.e_bands[start]) as i32).max(0);
-        let band_width = (mode.e_bands[coded_bands] - mode.e_bands[j]) as i32;
-        let mut band_bits = bits[j] + percoeff * band_width + rem;
-        if band_bits >= thresh[j].max(alloc_floor + (1 << BITRES)) {
-            if dec.dec_bit_logp(1) {
-                break;
-            }
-            psum += 1 << BITRES;
-            band_bits -= 1 << BITRES;
-        }
-        psum -= bits[j] + intensity_rsv;
-        if intensity_rsv > 0 {
-            intensity_rsv = LOG2_FRAC_TABLE[j - start] as i32;
-        }
-        psum += intensity_rsv;
-        bits[j] = if band_bits >= alloc_floor {
-            alloc_floor
+impl Reservations {
+    fn new(total: i32, channels: usize, coded_band_count: usize) -> Self {
+        let mut total_bits = total.max(0);
+        let skip = if total_bits >= (1 << BITRES) {
+            1 << BITRES
         } else {
             0
         };
-        psum += bits[j];
-        coded_bands -= 1;
+        total_bits -= skip;
+        let mut intensity = 0i32;
+        let mut dual_stereo = 0i32;
+        if channels == 2 {
+            intensity = LOG2_FRAC_TABLE[coded_band_count] as i32;
+            if intensity > total_bits {
+                intensity = 0;
+            } else {
+                total_bits -= intensity;
+                dual_stereo = if total_bits >= (1 << BITRES) {
+                    1 << BITRES
+                } else {
+                    0
+                };
+                total_bits -= dual_stereo;
+            }
+        }
+        Self {
+            total_bits,
+            skip,
+            intensity,
+            dual_stereo,
+        }
     }
-    coded_bands = coded_bands.max(start + 1);
+}
 
-    if intensity_rsv > 0 {
-        *intensity = start as i32 + dec.dec_uint((coded_bands + 1 - start) as u32) as i32;
-    } else {
-        *intensity = 0;
+/// Reparto inicial entre los dos vectores de asignación vecinos: `bits1` para el inferior y
+/// `bits2` para lo que añade el superior; `skip_start` es la última banda con refuerzo dinámico,
+/// por debajo de la cual no se decodifican saltos.
+struct AllocationBounds {
+    bits1: Vec<i32>,
+    bits2: Vec<i32>,
+    skip_start: usize,
+}
+
+/// Tablas por banda del reparto: umbral mínimo para codificarla (`thresh`) y desplazamiento por
+/// el recorte (`trim_offset`).
+struct Allocator<'r, 'a> {
+    request: &'r AllocationRequest<'a>,
+    /// Canales codificados.
+    c: i32,
+    thresh: Vec<i32>,
+    trim_offset: Vec<i32>,
+}
+
+impl<'r, 'a> Allocator<'r, 'a> {
+    fn new(request: &'r AllocationRequest<'a>) -> Self {
+        let AllocationRequest {
+            mode,
+            start,
+            end,
+            alloc_trim,
+            channels,
+            lm,
+            ..
+        } = *request;
+        let len = mode.nb_ebands;
+        let c = channels as i32;
+        let mut thresh = vec![0i32; len];
+        let mut trim_offset = vec![0i32; len];
+        for j in start..end {
+            let band_n = (mode.e_bands[j + 1] - mode.e_bands[j]) as i32;
+            thresh[j] = (c << BITRES)
+                .max(((ALLOC_THRESH_NUMERATOR * band_n) << lm << BITRES) >> ALLOC_THRESH_SHIFT);
+            trim_offset[j] = (c
+                * band_n
+                * (alloc_trim - ALLOC_TRIM_DEFAULT - lm as i32)
+                * (end - j - 1) as i32
+                * (1 << (lm as i32 + BITRES)))
+                >> TRIM_OFFSET_SHIFT;
+            if (band_n << lm) == 1 {
+                trim_offset[j] -= c << BITRES;
+            }
+        }
+        Self {
+            request,
+            c,
+            thresh,
+            trim_offset,
+        }
     }
-    if *intensity <= start as i32 {
-        total_adj += dual_stereo_rsv;
-        dual_stereo_rsv = 0;
+
+    /// Anchura de la banda `j` en la resolución de la tabla de bandas.
+    fn width(&self, j: usize) -> i32 {
+        let e_bands = self.request.mode.e_bands;
+        (e_bands[j + 1] - e_bands[j]) as i32
     }
-    if dual_stereo_rsv > 0 {
-        *dual_stereo = i32::from(dec.dec_bit_logp(1));
-    } else {
-        *dual_stereo = 0;
+
+    /// Mínimo que se da a una banda que no llega a su umbral pero se conserva: un bit por canal.
+    fn alloc_floor(&self) -> i32 {
+        self.c << BITRES
     }
-    if trace_packet0 {
-        debug_trace!(
-            "[RUST] alloc: coded_bands={} psum={} total_adj={}",
+
+    /// Bits del vector de asignación `vector` para la banda `j`, antes del recorte.
+    fn vector_bits(&self, vector: usize, j: usize) -> i32 {
+        let mode = self.request.mode;
+        let entry = mode.alloc_vectors[vector * mode.nb_ebands + j] as i32;
+        (self.c * self.width(j) * (entry << self.request.lm)) >> 2
+    }
+
+    /// Aplica el recorte a una asignación positiva, sin bajar de cero.
+    fn trimmed(&self, bits: i32, j: usize) -> i32 {
+        if bits > 0 {
+            (bits + self.trim_offset[j]).max(0)
+        } else {
+            bits
+        }
+    }
+
+    /// Bits que se gastarían con la asignación `band_bits`: desde la banda más alta, las que no
+    /// llegan a su umbral antes de la primera que sí lo hace se quedan con el mínimo o en cero,
+    /// y cada banda está limitada por su tope.
+    fn allocation_sum(&self, band_bits: impl Fn(usize) -> i32) -> i32 {
+        let alloc_floor = self.alloc_floor();
+        let mut psum = 0i32;
+        let mut done = false;
+        for j in (self.request.start..self.request.end).rev() {
+            let bits = band_bits(j);
+            if bits >= self.thresh[j] || done {
+                done = true;
+                psum += bits.min(self.request.cap[j]);
+            } else if bits >= alloc_floor {
+                psum += alloc_floor;
+            }
+        }
+        psum
+    }
+
+    /// Mayor vector de asignación cuyo reparto cabe en `total_bits` (búsqueda binaria).
+    fn search_vector(&self, total_bits: i32) -> usize {
+        let mut lo = 1i32;
+        let mut hi = self.request.mode.nb_alloc_vectors as i32 - 1;
+        while lo <= hi {
+            let mid = (lo + hi) >> 1;
+            let psum = self.allocation_sum(|j| {
+                self.trimmed(self.vector_bits(mid as usize, j), j) + self.request.offsets[j]
+            });
+            if psum > total_bits {
+                hi = mid - 1;
+            } else {
+                lo = mid + 1;
+            }
+        }
+        (lo - 1) as usize
+    }
+
+    /// Repartos de los vectores `lo` y `lo + 1` (o el tope de cada banda si `lo` es el último).
+    fn interpolation_bounds(&self, lo: usize) -> AllocationBounds {
+        let AllocationRequest {
+            mode,
+            start,
+            end,
+            offsets,
+            cap,
+            ..
+        } = *self.request;
+        let hi = lo + 1;
+        let mut bits1 = vec![0i32; mode.nb_ebands];
+        let mut bits2 = vec![0i32; mode.nb_ebands];
+        let mut skip_start = start;
+        for j in start..end {
+            let mut bits1j = self.trimmed(self.vector_bits(lo, j), j);
+            let upper = if hi >= mode.nb_alloc_vectors {
+                cap[j]
+            } else {
+                self.vector_bits(hi, j)
+            };
+            let mut bits2j = self.trimmed(upper, j);
+            if lo > 0 {
+                bits1j += offsets[j];
+            }
+            bits2j += offsets[j];
+            if offsets[j] > 0 {
+                skip_start = j;
+            }
+            bits1[j] = bits1j;
+            bits2[j] = (bits2j - bits1j).max(0);
+        }
+        AllocationBounds {
+            bits1,
+            bits2,
+            skip_start,
+        }
+    }
+
+    /// Interpola entre los dos vectores, decodifica los saltos, la intensidad y el estéreo dual,
+    /// y separa la energía fina (`interp_bits2pulses`).
+    fn interp_bits2pulses(
+        &self,
+        bounds: &AllocationBounds,
+        reserve: Reservations,
+        dec: &mut EcDec<'_>,
+    ) -> AllocationResult {
+        let AllocationRequest {
+            mode, start, end, ..
+        } = *self.request;
+        let step = self.interpolation_step(bounds, reserve.total_bits);
+        let (mut bits, psum) = self.interpolated_bits(bounds, step);
+        let skipped = self.decode_skips(&mut bits, psum, bounds.skip_start, reserve, dec);
+        let coded_bands = skipped.coded_bands;
+        let mut total = skipped.total;
+        let intensity = if skipped.intensity_rsv > 0 {
+            start as i32 + dec.dec_uint((coded_bands + 1 - start) as u32) as i32
+        } else {
+            0
+        };
+        let mut dual_stereo_rsv = reserve.dual_stereo;
+        if intensity <= start as i32 {
+            total += dual_stereo_rsv;
+            dual_stereo_rsv = 0;
+        }
+        let dual_stereo = if dual_stereo_rsv > 0 {
+            i32::from(dec.dec_bit_logp(1))
+        } else {
+            0
+        };
+        self.distribute_leftover(&mut bits, total - skipped.psum, coded_bands);
+
+        let len = mode.nb_ebands;
+        let mut fine_quant = vec![0i32; len];
+        let mut fine_priority = vec![0i32; len];
+        let stereo = StereoCoding {
+            intensity,
+            dual_stereo,
+        };
+        let mut balance = 0i32;
+        for j in start..coded_bands {
+            let fine = self.split_fine_energy(j, bits[j], balance, stereo);
+            bits[j] = fine.pulse_bits;
+            fine_quant[j] = fine.fine_bits;
+            fine_priority[j] = fine.priority;
+            balance = fine.excess;
+        }
+        let stereo_shift = self.stereo_shift();
+        for j in coded_bands..end {
+            fine_quant[j] = (bits[j] >> stereo_shift) >> BITRES;
+            bits[j] = 0;
+            fine_priority[j] = i32::from(fine_quant[j] < 1);
+        }
+        AllocationResult {
             coded_bands,
+            intensity,
+            dual_stereo,
+            balance,
+            pulses: bits,
+            fine_quant,
+            fine_priority,
+        }
+    }
+
+    /// `1` en estéreo: la energía fina de los dos canales sale de los mismos bits.
+    fn stereo_shift(&self) -> i32 {
+        if self.request.channels > 1 { 1 } else { 0 }
+    }
+
+    /// Paso de interpolación, en sesentaicuatroavos del tramo `bits2`, que más bits reparte sin
+    /// pasarse de `total` (búsqueda binaria de `ALLOC_STEPS` pasos).
+    fn interpolation_step(&self, bounds: &AllocationBounds, total: i32) -> i32 {
+        let mut lo = 0i32;
+        let mut hi = 1 << ALLOC_STEPS;
+        for _ in 0..ALLOC_STEPS {
+            let mid = (lo + hi) >> 1;
+            let psum =
+                self.allocation_sum(|j| bounds.bits1[j] + ((mid * bounds.bits2[j]) >> ALLOC_STEPS));
+            if psum > total {
+                hi = mid;
+            } else {
+                lo = mid;
+            }
+        }
+        lo
+    }
+
+    /// Reparto interpolado con el paso `step` y lo que suma.
+    fn interpolated_bits(&self, bounds: &AllocationBounds, step: i32) -> (Vec<i32>, i32) {
+        let alloc_floor = self.alloc_floor();
+        let mut bits = vec![0i32; self.request.mode.nb_ebands];
+        let mut psum = 0i32;
+        let mut done = false;
+        for j in (self.request.start..self.request.end).rev() {
+            let mut tmp = bounds.bits1[j] + ((step * bounds.bits2[j]) >> ALLOC_STEPS);
+            if tmp < self.thresh[j] && !done {
+                tmp = if tmp >= alloc_floor { alloc_floor } else { 0 };
+            } else {
+                done = true;
+            }
+            tmp = tmp.min(self.request.cap[j]);
+            bits[j] = tmp;
+            psum += tmp;
+        }
+        (bits, psum)
+    }
+
+    /// Decodifica, desde la banda más alta, qué bandas se dejan sin codificar: cada una que
+    /// alcanza su umbral cuesta un bit de decisión; las saltadas se quedan con el mínimo o en
+    /// cero y devuelven el resto al reparto.
+    fn decode_skips(
+        &self,
+        bits: &mut [i32],
+        mut psum: i32,
+        skip_start: usize,
+        reserve: Reservations,
+        dec: &mut EcDec<'_>,
+    ) -> SkipOutcome {
+        let e_bands = self.request.mode.e_bands;
+        let start = self.request.start;
+        let alloc_floor = self.alloc_floor();
+        let total = reserve.total_bits;
+        let mut total_adj = total;
+        let mut intensity_rsv = reserve.intensity;
+        let mut coded_bands = self.request.end;
+        loop {
+            let j = coded_bands - 1;
+            if j <= skip_start {
+                // Como libopus: el bit reservado para saltar solo se devuelve si se llega aquí.
+                total_adj += reserve.skip;
+                break;
+            }
+            let left = total - psum;
+            let denom = (e_bands[coded_bands] - e_bands[start]) as i32;
+            let percoeff = if denom > 0 { left / denom } else { 0 };
+            let left_rem = left - denom * percoeff;
+            let rem = (left_rem - (e_bands[j] - e_bands[start]) as i32).max(0);
+            let band_width = (e_bands[coded_bands] - e_bands[j]) as i32;
+            let mut band_bits = bits[j] + percoeff * band_width + rem;
+            if band_bits >= self.thresh[j].max(alloc_floor + (1 << BITRES)) {
+                if dec.dec_bit_logp(1) {
+                    break;
+                }
+                psum += 1 << BITRES;
+                band_bits -= 1 << BITRES;
+            }
+            psum -= bits[j] + intensity_rsv;
+            if intensity_rsv > 0 {
+                intensity_rsv = LOG2_FRAC_TABLE[j - start] as i32;
+            }
+            psum += intensity_rsv;
+            bits[j] = if band_bits >= alloc_floor {
+                alloc_floor
+            } else {
+                0
+            };
+            psum += bits[j];
+            coded_bands -= 1;
+        }
+        SkipOutcome {
+            coded_bands: coded_bands.max(start + 1),
             psum,
-            total_adj
-        );
+            total: total_adj,
+            intensity_rsv,
+        }
     }
 
-    let left = total_adj - psum;
-    let denom = (mode.e_bands[coded_bands] - mode.e_bands[start]) as i32;
-    let percoeff = if denom > 0 { left / denom } else { 0 };
-    let mut left_rem = left - denom * percoeff;
-    for (j, bits_j) in bits.iter_mut().enumerate().take(coded_bands).skip(start) {
-        *bits_j += percoeff * (mode.e_bands[j + 1] - mode.e_bands[j]) as i32;
-        let tmp = left_rem.min((mode.e_bands[j + 1] - mode.e_bands[j]) as i32);
-        *bits_j += tmp;
-        left_rem -= tmp;
+    /// Reparte `left` bits entre las bandas codificadas: lo mismo por coeficiente y el resto,
+    /// de abajo arriba, hasta la anchura de cada banda.
+    fn distribute_leftover(&self, bits: &mut [i32], left: i32, coded_bands: usize) {
+        let e_bands = self.request.mode.e_bands;
+        let start = self.request.start;
+        let denom = (e_bands[coded_bands] - e_bands[start]) as i32;
+        let percoeff = if denom > 0 { left / denom } else { 0 };
+        let mut left_rem = left - denom * percoeff;
+        for (j, bits_j) in bits.iter_mut().enumerate().take(coded_bands).skip(start) {
+            *bits_j += percoeff * self.width(j);
+            let tmp = left_rem.min(self.width(j));
+            *bits_j += tmp;
+            left_rem -= tmp;
+        }
     }
 
-    let mut balance = 0i32;
-    let stereo_shift = if stereo { 1 } else { 0 };
-    for j in start..coded_bands {
-        let n0 = (mode.e_bands[j + 1] - mode.e_bands[j]) as i32;
-        let n = n0 << lm;
-        let bit = bits[j] + balance;
+    /// Separa de los `bits` de la banda `j`, más el sobrante `balance` de la anterior, los de
+    /// energía fina; lo que pase del tope de la banda se convierte en energía fina extra o pasa a
+    /// la siguiente.
+    fn split_fine_energy(
+        &self,
+        j: usize,
+        bits: i32,
+        balance: i32,
+        stereo: StereoCoding,
+    ) -> FineSplit {
+        let AllocationRequest {
+            mode,
+            cap,
+            channels,
+            lm,
+            ..
+        } = *self.request;
+        let c = self.c;
+        let stereo_shift = self.stereo_shift();
+        let n = self.width(j) << lm;
+        let bit = bits + balance;
+        let mut pulse_bits;
+        let mut fine_bits;
+        let mut priority;
         let mut excess;
         if n > 1 {
             excess = (bit - cap[j]).max(0);
-            bits[j] = bit - excess;
+            pulse_bits = bit - excess;
             let den = c * n
-                + if channels == 2 && n > 2 && *dual_stereo == 0 && j < *intensity as usize {
+                + if channels == 2
+                    && n > 2
+                    && stereo.dual_stereo == 0
+                    && j < stereo.intensity as usize
+                {
                     1
                 } else {
                     0
                 };
-            let nclogn = den * (mode.log_n[j] as i32 + log_m);
+            let nclogn = den * (mode.log_n[j] as i32 + ((lm as i32) << BITRES));
             let mut offset = (nclogn >> 1) - den * FINE_OFFSET;
             if n == 2 {
                 offset += den << BITRES >> 2;
             }
-            if bits[j] + offset < den * 2 << BITRES {
+            if pulse_bits + offset < (den * FINE_BOOST_HIGH_BITS) << BITRES {
                 offset += nclogn >> 2;
-            } else if bits[j] + offset < den * 3 << BITRES {
+            } else if pulse_bits + offset < (den * FINE_BOOST_LOW_BITS) << BITRES {
                 offset += nclogn >> 3;
             }
-            let mut e = (bits[j] + offset + (den << (BITRES - 1))).max(0);
+            let mut e = (pulse_bits + offset + (den << (BITRES - 1))).max(0);
             e = (e / den) >> BITRES;
-            if c * e > (bits[j] >> BITRES) {
-                e = (bits[j] >> stereo_shift) >> BITRES;
+            if c * e > (pulse_bits >> BITRES) {
+                e = (pulse_bits >> stereo_shift) >> BITRES;
             }
-            e = e.min(MAX_FINE_BITS);
-            ebits[j] = e;
-            fine_priority[j] = i32::from(ebits[j] * (den << BITRES) >= bits[j] + offset);
-            bits[j] -= c * ebits[j] << BITRES;
+            fine_bits = e.min(MAX_FINE_BITS);
+            priority = i32::from(fine_bits * (den << BITRES) >= pulse_bits + offset);
+            pulse_bits -= (c * fine_bits) << BITRES;
         } else {
             excess = (bit - (c << BITRES)).max(0);
-            bits[j] = bit - excess;
-            ebits[j] = 0;
-            fine_priority[j] = 1;
+            pulse_bits = bit - excess;
+            fine_bits = 0;
+            priority = 1;
         }
         if excess > 0 {
             let extra_fine =
-                ((excess >> (stereo_shift + BITRES)).max(0)).min(MAX_FINE_BITS - ebits[j]);
-            ebits[j] += extra_fine;
+                ((excess >> (stereo_shift + BITRES)).max(0)).min(MAX_FINE_BITS - fine_bits);
+            fine_bits += extra_fine;
             let extra_bits = (extra_fine * c) << BITRES;
-            fine_priority[j] = i32::from(extra_bits >= excess - balance);
+            priority = i32::from(extra_bits >= excess - balance);
             excess -= extra_bits;
         }
-        balance = excess;
+        FineSplit {
+            pulse_bits,
+            fine_bits,
+            priority,
+            excess,
+        }
     }
-    for j in coded_bands..end {
-        ebits[j] = bits[j] >> if stereo { 1 } else { 0 } >> BITRES;
-        bits[j] = 0;
-        fine_priority[j] = i32::from(ebits[j] < 1);
-    }
-    (coded_bands, balance)
+}
+
+/// Banda de intensidad y estéreo dual ya decodificados, que cambian el reparto de energía fina.
+#[derive(Debug, Clone, Copy)]
+struct StereoCoding {
+    intensity: i32,
+    dual_stereo: i32,
+}
+
+/// Resultado de decodificar los saltos de bandas.
+struct SkipOutcome {
+    coded_bands: usize,
+    /// Bits ya repartidos y presupuesto total tras devolver la reserva de salto.
+    psum: i32,
+    total: i32,
+    /// Reserva de intensidad que queda, según la última banda codificada.
+    intensity_rsv: i32,
+}
+
+/// Reparto de una banda entre pulsos y energía fina.
+struct FineSplit {
+    pulse_bits: i32,
+    fine_bits: i32,
+    /// 1 si la banda tiene prioridad para los bits de energía fina sobrantes.
+    priority: i32,
+    /// Lo que pasa a la banda siguiente.
+    excess: i32,
 }

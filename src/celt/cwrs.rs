@@ -1,20 +1,9 @@
-//! CELT combinatorial PVQ pulse decoding (`cwrs.c`) for decode path.
+//! Decodificación combinatoria de los pulsos PVQ de CELT (`cwrs.c`).
 
 use crate::entropy::EcDec;
 
-/// Result of decoding one CWRS PVQ codeword.
-#[derive(Debug, Clone)]
-pub(crate) struct PulseDecode {
-    pub yy: u32,
-    pub pulses: Vec<i32>,
-    pub nc: u32,
-    pub index: u32,
-}
-
-/// Compute U(n, k) row up to `k+1` and return V(n, k).
-///
-/// Params: `n` dimensions, `k` pulses.
-/// Returns: `(u_row, v_nk)` where `u_row[i] = U(n, i)`.
+/// Fila de `U(n, i)` para `i` hasta `k + 1` y número de vectores `V(n, k)` con `k` pulsos en
+/// `n` dimensiones. Devuelve `(fila, V(n, k))`, con `fila[i] = U(n, i)`.
 fn ncwrs_urow(n: usize, k: usize) -> (Vec<u32>, u32) {
     let len = k + 2;
     let mut u = vec![0u32; len];
@@ -30,10 +19,7 @@ fn ncwrs_urow(n: usize, k: usize) -> (Vec<u32>, u32) {
     (u, v)
 }
 
-/// Advance one recurrence row for U-table generation.
-///
-/// Params: mutable row slice and first base value.
-/// Returns: nothing.
+/// Avanza la fila de `U` una dimensión (`unext`), con `u0` como primer valor.
 fn unext(u: &mut [u32], mut u0: u32) {
     if u.len() < 2 {
         return;
@@ -47,10 +33,7 @@ fn unext(u: &mut [u32], mut u0: u32) {
     u[last] = u0;
 }
 
-/// Step recurrence backwards for one dimension removal.
-///
-/// Params: mutable row slice and first base value.
-/// Returns: nothing.
+/// Retrocede la fila de `U` una dimensión (`uprev`), con `u0` como primer valor.
 fn uprev(u: &mut [u32], mut u0: u32) {
     if u.len() < 2 {
         return;
@@ -64,12 +47,9 @@ fn uprev(u: &mut [u32], mut u0: u32) {
     u[last] = u0;
 }
 
-/// Decode CWRS index into signed pulse vector.
-///
-/// Params: `n` dimensions, `k` pulses, index `idx`, and mutable U-row scratch.
-/// Returns: `(sum_of_squares, decoded_vector)`.
-fn cwrsi(n: usize, mut k: usize, mut idx: u32, u: &mut [u32]) -> (u32, Vec<i32>) {
-    let mut yy = 0u32;
+/// Convierte el índice `idx` en el vector de `k` pulsos con signo y `n` dimensiones (`cwrsi`),
+/// usando y gastando la fila de `U` de `u`.
+fn cwrsi(n: usize, mut k: usize, mut idx: u32, u: &mut [u32]) -> Vec<i32> {
     let mut y = vec![0i32; n];
     for yj in y.iter_mut().take(n) {
         let p = u[k + 1];
@@ -89,32 +69,18 @@ fn cwrsi(n: usize, mut k: usize, mut idx: u32, u: &mut [u32]) -> (u32, Vec<i32>)
             val = -val;
         }
         *yj = val;
-        yy = yy.wrapping_add((val * val) as u32);
         uprev(&mut u[..=k + 1], 0);
     }
-    (yy, y)
+    y
 }
 
-/// Decode PVQ pulses from range coder.
-///
-/// Params: range decoder, `n` dimensions and `k` pulses.
-/// Returns: `(sum_of_squares, decoded_signed_pulses)`.
-pub(crate) fn decode_pulses(dec: &mut EcDec<'_>, n: usize, k: usize) -> PulseDecode {
+/// Lee del decodificador de rango un vector de `k` pulsos con signo y `n` dimensiones
+/// (`decode_pulses`): un índice uniforme entre los `V(n, k)` posibles.
+pub(crate) fn decode_pulses(dec: &mut EcDec<'_>, n: usize, k: usize) -> Vec<i32> {
     if n == 0 || k == 0 {
-        return PulseDecode {
-            yy: 0,
-            pulses: vec![0; n],
-            nc: 0,
-            index: 0,
-        };
+        return vec![0; n];
     }
     let (mut u, nc) = ncwrs_urow(n, k);
     let idx = dec.dec_uint(nc.max(2));
-    let (yy, pulses) = cwrsi(n, k, idx, &mut u);
-    PulseDecode {
-        yy,
-        pulses,
-        nc,
-        index: idx,
-    }
+    cwrsi(n, k, idx, &mut u)
 }

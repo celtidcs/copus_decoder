@@ -1,46 +1,60 @@
-//! Opus multistream decoder — wraps multiple `OpusDecoder` instances
-//! and demultiplexes channel mapping per RFC 7845 §5.1.
+//! Decodificador multiflujo: un `OpusDecoder` por flujo y el reparto de sus canales según el
+//! mapa de canales (RFC 7845 §5.1.1).
 //!
-//! Mirrors the wrapper logic from libopus `opus_multistream_decoder.c`.
+//! Sigue la lógica de `opus_multistream_decoder.c` de libopus.
 
 use crate::packet;
 use crate::{OpusDecoder, OpusError};
 
-/// Opus multistream decoder.
+/// Decodificación de un flujo con un tipo de muestra: [`OpusDecoder::decode`] o
+/// [`OpusDecoder::decode_float`].
+type StreamDecode<T> = fn(&mut OpusDecoder, &[u8], &mut [T], bool) -> Result<usize, OpusError>;
+
+/// Entrada del mapa de canales que deja el canal de salida en silencio (RFC 7845 §5.1.1).
+const SILENT_CHANNEL: u8 = 255;
+/// Máximo de canales de salida: el mapa usa un byte por canal (RFC 7845 §5.1.1).
+const MAX_OUTPUT_CHANNELS: usize = 255;
+
+/// Decodificador Opus multiflujo.
 ///
-/// Holds one `OpusDecoder` per stream. Coupled streams use stereo decoders and
-/// remaining streams use mono decoders.
+/// Tiene un `OpusDecoder` por flujo: estéreo para los flujos acoplados y mono para el resto.
 pub struct OpusMultistreamDecoder {
-    /// One decoder per stream. Coupled streams are stereo (2ch), rest mono.
+    /// Un decodificador por flujo: los acoplados, estéreo; el resto, mono.
     decoders: Vec<OpusDecoder>,
-    /// Total output channels (1–255).
+    /// Canales de salida (de 1 a 255).
     nb_channels: usize,
-    /// Total streams in packet (coupled + mono).
+    /// Flujos del paquete, acoplados y mono.
     nb_streams: usize,
-    /// Streams that are stereo-coupled (always the first `nb_coupled_streams`).
+    /// Flujos acoplados en estéreo, que son siempre los primeros.
     nb_coupled_streams: usize,
-    /// `mapping[output_channel] = index into interleaved decoder outputs`.
-    /// `255` means "silence this output channel".
+    /// `mapping[canal_de_salida]` es el índice del canal decodificado, contando primero los dos
+    /// de cada flujo acoplado y después uno por flujo mono; `SILENT_CHANNEL` deja el canal en
+    /// silencio.
     mapping: Vec<u8>,
-    /// Output sample rate (same for all streams).
+    /// Frecuencia de salida, la misma para todos los flujos.
     sample_rate: u32,
 }
 
 impl OpusMultistreamDecoder {
-    /// Create a new multistream decoder.
+    /// Crea un decodificador multiflujo con frecuencia de salida `sample_rate`, `nb_channels`
+    /// canales de salida, `nb_streams` flujos (los `nb_coupled_streams` primeros, estéreo) y el
+    /// mapa de canales `mapping`, con una entrada por canal de salida.
     ///
-    /// Parameters: `sample_rate`, total output `nb_channels`, `nb_streams`,
-    /// `nb_coupled_streams`, and per-output-channel `mapping`.
-    /// Returns: initialized multistream decoder on success.
+    /// # Errores
+    ///
+    /// `InvalidArgument`, con el nombre del parámetro, si no hay canales o hay más de 255, si no
+    /// hay flujos, si hay más acoplados que flujos o más flujos de los que caben en el mapa, si
+    /// `mapping` no tiene una entrada por canal o si alguna señala un canal que no existe; y los
+    /// de [`OpusDecoder::new`] si la frecuencia no está admitida.
     ///
     /// # Examples
     ///
     /// ```rust
-    /// use opus_decoder::OpusMultistreamDecoder;
+    /// use copus_decoder::OpusMultistreamDecoder;
     ///
     /// let decoder = OpusMultistreamDecoder::new(48_000, 2, 2, 0, &[0, 1])?;
     /// # let _ = decoder;
-    /// # Ok::<(), opus_decoder::OpusError>(())
+    /// # Ok::<(), copus_decoder::OpusError>(())
     /// ```
     pub fn new(
         sample_rate: u32,
@@ -49,7 +63,7 @@ impl OpusMultistreamDecoder {
         nb_coupled_streams: usize,
         mapping: &[u8],
     ) -> Result<Self, OpusError> {
-        if nb_channels == 0 || nb_channels > 255 {
+        if nb_channels == 0 || nb_channels > MAX_OUTPUT_CHANNELS {
             return Err(OpusError::InvalidArgument("nb_channels"));
         }
         if nb_streams == 0 {
@@ -58,7 +72,7 @@ impl OpusMultistreamDecoder {
         if nb_coupled_streams > nb_streams {
             return Err(OpusError::InvalidArgument("nb_coupled_streams"));
         }
-        if nb_streams > 255usize.saturating_sub(nb_coupled_streams) {
+        if nb_streams > MAX_OUTPUT_CHANNELS.saturating_sub(nb_coupled_streams) {
             return Err(OpusError::InvalidArgument("nb_streams"));
         }
         if mapping.len() != nb_channels {
@@ -67,7 +81,7 @@ impl OpusMultistreamDecoder {
 
         let total_decoded_channels = (2 * nb_coupled_streams) + (nb_streams - nb_coupled_streams);
         for &slot in mapping {
-            if slot != 255 && usize::from(slot) >= total_decoded_channels {
+            if slot != SILENT_CHANNEL && usize::from(slot) >= total_decoded_channels {
                 return Err(OpusError::InvalidArgument("mapping"));
             }
         }
@@ -92,18 +106,23 @@ impl OpusMultistreamDecoder {
         })
     }
 
-    /// Decode a multistream packet into interleaved i16 PCM.
+    /// Decodifica un paquete multiflujo en PCM `i16` entrelazado.
     ///
-    /// Parameters: multistream `packet`, writable interleaved `pcm`, and `fec`.
-    /// - `fec`: reserved for future in-band FEC support. Currently treated as
-    ///   packet loss concealment (PLC) when `true`. Pass `false` for normal decode.
+    /// `pcm` recibe las muestras de los `nb_channels` canales de salida, entrelazadas, en el
+    /// orden del mapa de canales. Con `fec` a `true`, o con un paquete vacío, se oculta una
+    /// pérdida: la corrección de errores de la banda (FEC) aún no se usa. Devuelve las muestras
+    /// por canal.
     ///
-    /// Returns: decoded samples per output channel.
+    /// # Errores
+    ///
+    /// `InvalidPacket` si el paquete no se puede partir en un subpaquete por flujo o los flujos
+    /// no duran lo mismo, `BufferTooSmall` si la trama no cabe en `pcm`, y los de
+    /// [`OpusDecoder::decode`] en cada flujo.
     ///
     /// # Examples
     ///
     /// ```rust,no_run
-    /// use opus_decoder::OpusMultistreamDecoder;
+    /// use copus_decoder::OpusMultistreamDecoder;
     ///
     /// let mut decoder = OpusMultistreamDecoder::new(48_000, 2, 2, 0, &[0, 1])?;
     /// let packet = std::fs::read("multistream-frame.opus")?;
@@ -118,64 +137,21 @@ impl OpusMultistreamDecoder {
         pcm: &mut [i16],
         fec: bool,
     ) -> Result<usize, OpusError> {
-        let sub_packets = if packet.is_empty() || fec {
-            vec![&[][..]; self.nb_streams]
-        } else {
-            split_multistream_packet(packet, self.nb_streams)?
-        };
-        let frame_size = self.expected_frame_size(&sub_packets, fec)?;
-        let needed = frame_size * self.nb_channels;
-        if pcm.len() < needed {
-            return Err(OpusError::BufferTooSmall);
-        }
-        if frame_size == 0 {
-            return Ok(0);
-        }
-
-        let mut stream_pcm = Vec::with_capacity(self.nb_streams);
-        for (stream_idx, sub_packet) in sub_packets.iter().enumerate() {
-            let channels = self.stream_channels(stream_idx);
-            let mut buf = vec![0i16; frame_size * channels];
-            let written = self.decoders[stream_idx].decode(sub_packet, &mut buf, fec)?;
-            if written != frame_size {
-                return Err(OpusError::InvalidPacket);
-            }
-            stream_pcm.push(buf);
-        }
-
-        for (channel_idx, &slot) in self.mapping.iter().enumerate() {
-            if slot == 255 {
-                zero_output_channel_i16(pcm, self.nb_channels, channel_idx, frame_size);
-                continue;
-            }
-
-            let (stream_idx, source_channel) = self.slot_to_stream_channel(usize::from(slot));
-            copy_output_channel_i16(
-                pcm,
-                self.nb_channels,
-                channel_idx,
-                &stream_pcm[stream_idx],
-                self.stream_channels(stream_idx),
-                source_channel,
-                frame_size,
-            );
-        }
-
-        Ok(frame_size)
+        self.decode_samples(packet, pcm, fec, OpusDecoder::decode)
     }
 
-    /// Decode a multistream packet into interleaved f32 PCM.
+    /// Decodifica un paquete multiflujo en PCM `f32` entrelazado; por lo demás, como
+    /// [`OpusMultistreamDecoder::decode`].
     ///
-    /// Parameters: multistream `packet`, writable interleaved `pcm`, and `fec`.
-    /// - `fec`: reserved for future in-band FEC support. Currently treated as
-    ///   packet loss concealment (PLC) when `true`. Pass `false` for normal decode.
+    /// # Errores
     ///
-    /// Returns: decoded samples per output channel.
+    /// Los de [`OpusMultistreamDecoder::decode`], con [`OpusDecoder::decode_float`] en cada
+    /// flujo.
     ///
     /// # Examples
     ///
     /// ```rust,no_run
-    /// use opus_decoder::OpusMultistreamDecoder;
+    /// use copus_decoder::OpusMultistreamDecoder;
     ///
     /// let mut decoder = OpusMultistreamDecoder::new(48_000, 2, 2, 0, &[0, 1])?;
     /// let packet = std::fs::read("multistream-frame.opus")?;
@@ -189,6 +165,18 @@ impl OpusMultistreamDecoder {
         packet: &[u8],
         pcm: &mut [f32],
         fec: bool,
+    ) -> Result<usize, OpusError> {
+        self.decode_samples(packet, pcm, fec, OpusDecoder::decode_float)
+    }
+
+    /// Camino común de [`Self::decode`] y [`Self::decode_float`]: parte el paquete, decodifica
+    /// cada flujo con `decode_stream` y reparte sus canales según el mapa.
+    fn decode_samples<T: Copy + Default>(
+        &mut self,
+        packet: &[u8],
+        pcm: &mut [T],
+        fec: bool,
+        decode_stream: StreamDecode<T>,
     ) -> Result<usize, OpusError> {
         let sub_packets = if packet.is_empty() || fec {
             vec![&[][..]; self.nb_streams]
@@ -207,55 +195,59 @@ impl OpusMultistreamDecoder {
         let mut stream_pcm = Vec::with_capacity(self.nb_streams);
         for (stream_idx, sub_packet) in sub_packets.iter().enumerate() {
             let channels = self.stream_channels(stream_idx);
-            let mut buf = vec![0.0f32; frame_size * channels];
-            let written = self.decoders[stream_idx].decode_float(sub_packet, &mut buf, fec)?;
+            let mut buf = vec![T::default(); frame_size * channels];
+            let written = decode_stream(&mut self.decoders[stream_idx], sub_packet, &mut buf, fec)?;
             if written != frame_size {
                 return Err(OpusError::InvalidPacket);
             }
             stream_pcm.push(buf);
         }
 
+        let output = Interleaved {
+            stride: self.nb_channels,
+            frame_size,
+        };
         for (channel_idx, &slot) in self.mapping.iter().enumerate() {
-            if slot == 255 {
-                zero_output_channel_f32(pcm, self.nb_channels, channel_idx, frame_size);
+            if slot == SILENT_CHANNEL {
+                output.fill_channel(pcm, channel_idx, T::default());
                 continue;
             }
-
             let (stream_idx, source_channel) = self.slot_to_stream_channel(usize::from(slot));
-            copy_output_channel_f32(
+            let source = Interleaved {
+                stride: self.stream_channels(stream_idx),
+                frame_size,
+            };
+            output.copy_channel(
                 pcm,
-                self.nb_channels,
                 channel_idx,
                 &stream_pcm[stream_idx],
-                self.stream_channels(stream_idx),
+                source,
                 source_channel,
-                frame_size,
             );
         }
 
         Ok(frame_size)
     }
 
-    /// Reset all internal decoders.
-    ///
-    /// Parameters: none.
-    /// Returns: nothing.
+    /// Reinicia los decodificadores de todos los flujos, como si no hubieran recibido nada.
     pub fn reset(&mut self) {
         for decoder in &mut self.decoders {
             decoder.reset();
         }
     }
 
-    /// Compute the expected frame size for one multistream decode call.
+    /// Muestras por canal que dará el paquete: las de la última trama si se oculta una pérdida
+    /// y, si no, las de sus subpaquetes, que han de coincidir.
     ///
-    /// Parameters: per-stream `sub_packets` and FEC flag `fec`.
-    /// Returns: decoded samples per output channel.
+    /// # Errores
+    ///
+    /// `InvalidPacket` si algún subpaquete no es válido o los subpaquetes duran distinto.
     fn expected_frame_size(&self, sub_packets: &[&[u8]], fec: bool) -> Result<usize, OpusError> {
         if fec || sub_packets.iter().all(|packet| packet.is_empty()) {
             return Ok(self
                 .decoders
                 .first()
-                .map(|decoder| decoder.last_packet_duration)
+                .map(OpusDecoder::last_packet_duration)
                 .unwrap_or(0));
         }
 
@@ -276,10 +268,7 @@ impl OpusMultistreamDecoder {
         Ok(frame_size.unwrap_or(0))
     }
 
-    /// Return the decoded channel count for one elementary stream.
-    ///
-    /// Parameters: `stream_idx` elementary stream index.
-    /// Returns: `2` for coupled streams and `1` for mono streams.
+    /// Canales del flujo `stream_idx`: 2 si es acoplado y 1 si es mono.
     fn stream_channels(&self, stream_idx: usize) -> usize {
         if stream_idx < self.nb_coupled_streams {
             2
@@ -288,10 +277,7 @@ impl OpusMultistreamDecoder {
         }
     }
 
-    /// Map one decoded channel slot to `(stream_idx, channel_idx)`.
-    ///
-    /// Parameters: flattened decoded `slot`.
-    /// Returns: elementary stream index and channel index within that stream.
+    /// Flujo, y canal dentro del flujo, que corresponden a la entrada `slot` del mapa.
     fn slot_to_stream_channel(&self, slot: usize) -> (usize, usize) {
         let coupled_slots = 2 * self.nb_coupled_streams;
         if slot < coupled_slots {
@@ -302,10 +288,13 @@ impl OpusMultistreamDecoder {
     }
 }
 
-/// Split a multistream packet into per-stream sub-packets.
+/// Parte un paquete multiflujo en un subpaquete por flujo, en orden: todos menos el último
+/// llevan delante su longitud (RFC 6716, apéndice B) y el último ocupa el resto.
 ///
-/// Parameters: full multistream `packet` and total `nb_streams`.
-/// Returns: borrowed sub-packet slices in stream order.
+/// # Errores
+///
+/// `InvalidArgument` si no hay flujos e `InvalidPacket` si una longitud falta o se sale del
+/// paquete.
 fn split_multistream_packet(packet: &[u8], nb_streams: usize) -> Result<Vec<&[u8]>, OpusError> {
     if nb_streams == 0 {
         return Err(OpusError::InvalidArgument("nb_streams"));
@@ -333,95 +322,45 @@ fn split_multistream_packet(packet: &[u8], nb_streams: usize) -> Result<Vec<&[u8
     Ok(out)
 }
 
-/// Parse one self-delimited multistream sub-packet length.
+/// Lee la longitud de un subpaquete autodelimitado, con la misma codificación de uno o dos
+/// bytes que las longitudes de trama (RFC 6716, apéndice B). Devuelve `(longitud, bytes_leídos)`.
 ///
-/// Parameters: encoded length `data`.
-/// Returns: tuple `(packet_len, bytes_used)`.
+/// # Errores
+///
+/// `InvalidPacket` si faltan bytes.
 fn parse_self_delimited_size(data: &[u8]) -> Result<(usize, usize), OpusError> {
-    if data.is_empty() {
-        return Err(OpusError::InvalidPacket);
-    }
+    packet::parse_size(data).map_err(OpusError::from)
+}
 
-    let first = usize::from(data[0]);
-    if first < 252 {
-        Ok((first, 1))
-    } else {
-        if data.len() < 2 {
-            return Err(OpusError::InvalidPacket);
+/// Forma de un búfer entrelazado: `stride` canales y `frame_size` muestras por canal.
+#[derive(Debug, Clone, Copy)]
+struct Interleaved {
+    stride: usize,
+    frame_size: usize,
+}
+
+impl Interleaved {
+    /// Escribe `value` en todas las muestras del canal `channel` de `pcm`.
+    fn fill_channel<T: Copy>(self, pcm: &mut [T], channel: usize, value: T) {
+        for sample_idx in 0..self.frame_size {
+            pcm[sample_idx * self.stride + channel] = value;
         }
-        Ok((first + (4 * usize::from(data[1])), 2))
     }
-}
 
-/// Copy one decoded i16 channel into the interleaved multistream output buffer.
-///
-/// Parameters: mutable destination `pcm`, destination `dst_stride`, output
-/// channel index `dst_channel`, source `src`, source `src_stride`, source
-/// channel index `src_channel`, and `frame_size`.
-/// Returns: nothing; destination channel is overwritten.
-fn copy_output_channel_i16(
-    pcm: &mut [i16],
-    dst_stride: usize,
-    dst_channel: usize,
-    src: &[i16],
-    src_stride: usize,
-    src_channel: usize,
-    frame_size: usize,
-) {
-    for sample_idx in 0..frame_size {
-        pcm[sample_idx * dst_stride + dst_channel] = src[sample_idx * src_stride + src_channel];
-    }
-}
-
-/// Zero one interleaved i16 output channel.
-///
-/// Parameters: mutable destination `pcm`, destination `dst_stride`, output
-/// channel index `dst_channel`, and `frame_size`.
-/// Returns: nothing; destination channel is zero-filled.
-fn zero_output_channel_i16(
-    pcm: &mut [i16],
-    dst_stride: usize,
-    dst_channel: usize,
-    frame_size: usize,
-) {
-    for sample_idx in 0..frame_size {
-        pcm[sample_idx * dst_stride + dst_channel] = 0;
-    }
-}
-
-/// Copy one decoded f32 channel into the interleaved multistream output buffer.
-///
-/// Parameters: mutable destination `pcm`, destination `dst_stride`, output
-/// channel index `dst_channel`, source `src`, source `src_stride`, source
-/// channel index `src_channel`, and `frame_size`.
-/// Returns: nothing; destination channel is overwritten.
-fn copy_output_channel_f32(
-    pcm: &mut [f32],
-    dst_stride: usize,
-    dst_channel: usize,
-    src: &[f32],
-    src_stride: usize,
-    src_channel: usize,
-    frame_size: usize,
-) {
-    for sample_idx in 0..frame_size {
-        pcm[sample_idx * dst_stride + dst_channel] = src[sample_idx * src_stride + src_channel];
-    }
-}
-
-/// Zero one interleaved f32 output channel.
-///
-/// Parameters: mutable destination `pcm`, destination `dst_stride`, output
-/// channel index `dst_channel`, and `frame_size`.
-/// Returns: nothing; destination channel is zero-filled.
-fn zero_output_channel_f32(
-    pcm: &mut [f32],
-    dst_stride: usize,
-    dst_channel: usize,
-    frame_size: usize,
-) {
-    for sample_idx in 0..frame_size {
-        pcm[sample_idx * dst_stride + dst_channel] = 0.0;
+    /// Copia en el canal `channel` de `pcm` el canal `src_channel` de `src`, que tiene la forma
+    /// `src_shape`.
+    fn copy_channel<T: Copy>(
+        self,
+        pcm: &mut [T],
+        channel: usize,
+        src: &[T],
+        src_shape: Interleaved,
+        src_channel: usize,
+    ) {
+        for sample_idx in 0..self.frame_size {
+            pcm[sample_idx * self.stride + channel] =
+                src[sample_idx * src_shape.stride + src_channel];
+        }
     }
 }
 
@@ -429,10 +368,7 @@ fn zero_output_channel_f32(
 mod tests {
     use super::*;
 
-    /// Split one two-stream packet with a one-byte length prefix.
-    ///
-    /// Parameters: none.
-    /// Returns: nothing; panics on mismatch.
+    /// Paquete de dos flujos con la longitud del primero en un byte.
     #[test]
     fn split_two_stream_packet_with_short_prefix() {
         let packet = [3u8, 10, 11, 12, 20, 21];
@@ -440,10 +376,7 @@ mod tests {
         assert_eq!(sub_packets, vec![&[10, 11, 12][..], &[20, 21][..]]);
     }
 
-    /// Split one empty packet into PLC sub-packets for all streams.
-    ///
-    /// Parameters: none.
-    /// Returns: nothing; panics on mismatch.
+    /// Un paquete vacío da un subpaquete vacío (ocultación) por flujo.
     #[test]
     fn split_empty_packet_for_plc() {
         let sub_packets = split_multistream_packet(&[], 3).unwrap();
