@@ -10,7 +10,8 @@ use super::pitch;
 use super::plc::SilkPlcState;
 use super::tables::{
     LTP_MEM_LENGTH_MS, LTP_ORDER, MAX_FRAME_LENGTH, MAX_LPC_ORDER, MAX_NB_SUBFR,
-    MAX_SUB_FRAME_LENGTH, ONE_Q16, QUANT_LEVEL_ADJUST_Q10, QUANTIZATION_OFFSETS_Q10, TYPE_VOICED,
+    MAX_SUB_FRAME_LENGTH, ONE_Q16, QUANT_LEVEL_ADJUST_Q10, QUANTIZATION_OFFSETS_Q10,
+    TYPE_NO_VOICE_ACTIVITY, TYPE_VOICED,
 };
 
 /// Valores iniciales del estado del canal: ganancia anterior 1,0 en Q16 (`silk_init_decoder`),
@@ -88,6 +89,18 @@ impl SilkChannelState {
             self.lag_prev = self.plc.pitch_lag;
         }
     }
+
+    /// Reinicia la síntesis del canal lateral cuando vuelve a codificarse tras una trama solo de
+    /// medio, como `silk_Decode` de libopus: borra la salida reciente y la memoria LPC, y devuelve
+    /// a sus valores iniciales el lag, el último índice de ganancia y el tipo de señal anterior.
+    /// Conserva la ganancia anterior y el estado de la ocultación.
+    pub(super) fn reset_side_after_mid_only(&mut self) {
+        self.out_buf.fill(0);
+        self.s_lpc_q14_buf.fill(0);
+        self.lag_prev = INITIAL_LAG_PREV;
+        self.last_gain_index = INITIAL_LAST_GAIN_INDEX;
+        self.prev_signal_type = TYPE_NO_VOICE_ACTIVITY;
+    }
 }
 
 impl Default for SilkChannelState {
@@ -97,7 +110,7 @@ impl Default for SilkChannelState {
         Self {
             prev_gain_q16: ONE_Q16,
             last_gain_index: INITIAL_LAST_GAIN_INDEX,
-            prev_signal_type: 0,
+            prev_signal_type: TYPE_NO_VOICE_ACTIVITY,
             lag_prev: INITIAL_LAG_PREV,
             s_lpc_q14_buf: [0; MAX_LPC_ORDER],
             out_buf: [0; MAX_FRAME_LENGTH + 2 * MAX_SUB_FRAME_LENGTH],
@@ -442,8 +455,8 @@ fn lpc_analysis_filter(output: &mut [i16], input: &[i16], a_q12: &[i16], len: us
 
 #[cfg(test)]
 mod tests {
-    use super::{INITIAL_LAG_PREV, SilkChannelState};
-    use crate::silk::tables::LTP_MEM_LENGTH_MS;
+    use super::{INITIAL_LAG_PREV, INITIAL_LAST_GAIN_INDEX, SilkChannelState};
+    use crate::silk::tables::{LTP_MEM_LENGTH_MS, TYPE_NO_VOICE_ACTIVITY, TYPE_VOICED};
 
     /// Frecuencia interna de las pruebas, en kHz: la historia de tono es de 160 muestras.
     const FS_KHZ: i32 = 8;
@@ -478,6 +491,32 @@ mod tests {
         }
         assert_eq!(&state.out_buf[kept..ltp_mem_length], &frame[..]);
         assert_eq!(state.lag_prev, CONCEALED_LAG);
+    }
+
+    /// Ganancia anterior de la prueba de reinicio, distinta de la inicial (1,0 en Q16).
+    const KEPT_GAIN_Q16: i32 = 12_345;
+
+    /// El reinicio del canal lateral borra la salida reciente y la memoria LPC y devuelve el lag,
+    /// el último índice de ganancia y el tipo de señal a sus valores iniciales; la ganancia
+    /// anterior y la ocultación se conservan, como en `silk_Decode` de libopus.
+    #[test]
+    fn side_reset_after_mid_only_clears_synthesis_history() {
+        let mut state = numbered_state(CONCEALED_LAG);
+        state.s_lpc_q14_buf.fill(-7);
+        state.lag_prev = CONCEALED_LAG;
+        state.last_gain_index = INITIAL_LAST_GAIN_INDEX + 5;
+        state.prev_signal_type = TYPE_VOICED;
+        state.prev_gain_q16 = KEPT_GAIN_Q16;
+
+        state.reset_side_after_mid_only();
+
+        assert!(state.out_buf.iter().all(|&sample| sample == 0));
+        assert!(state.s_lpc_q14_buf.iter().all(|&value| value == 0));
+        assert_eq!(state.lag_prev, INITIAL_LAG_PREV);
+        assert_eq!(state.last_gain_index, INITIAL_LAST_GAIN_INDEX);
+        assert_eq!(state.prev_signal_type, TYPE_NO_VOICE_ACTIVITY);
+        assert_eq!(state.prev_gain_q16, KEPT_GAIN_Q16);
+        assert_eq!(state.plc.pitch_lag, CONCEALED_LAG);
     }
 
     /// Una ocultación sin lag de tono (trama sorda) no cambia el lag anterior.

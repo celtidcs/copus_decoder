@@ -87,10 +87,9 @@ const STEREO_MERGE_MIN_ENERGY: f32 = 6.0e-4;
 /// Las tablas de entrelazado de bits indexan 4 bits.
 const INTERLEAVE_NIBBLE_BITS: u32 = 4;
 const INTERLEAVE_NIBBLE_MASK: u32 = 0x0F;
-/// Cota del logaritmo de la ganancia al desnormalizar. **Ojo:** libopus limita por arriba
-/// (`celt_exp2_db(MIN32(32.f, lg))`); esta implementación, heredada de la original, limita por
-/// abajo. Ver `documentacion/defectos-conocidos.md`.
-const DENORMALISE_LOG_GAIN_BOUND: f32 = -32.0;
+/// Cota superior del logaritmo de la ganancia al desnormalizar, como libopus en coma flotante
+/// (`celt_exp2_db(MIN32(32.f, lg))` en `celt/bands.c`): la ganancia no pasa de 2^32.
+const DENORMALISE_MAX_LOG_GAIN: f32 = 32.0;
 
 /// Siguiente semilla del generador congruencial de CELT (`celt_lcg_rand`), del que salen el
 /// ruido del relleno y del plegado.
@@ -1424,8 +1423,19 @@ pub(crate) fn quant_all_bands_mono(
     let mut norm_hist = vec![0.0f32; x.len()];
     for i in frame.start..frame.end {
         let slot = walk.begin(i, dec);
-        // A diferencia de libopus, aquí no se llama a `special_hybrid_folding` en `start + 1`
-        // (heredado del original; ver documentacion/defectos-conocidos.md).
+        // Como libopus, con cualquier número de canales: sin esto, en las tramas híbridas la
+        // banda `start + 1` plegaría desde un historial que sigue a cero.
+        if i == frame.start + 1 {
+            let norm_offset = walk.norm_offset;
+            special_hybrid_folding_decode(
+                frame.mode,
+                &mut norm_hist[norm_offset..],
+                &mut [],
+                frame.start,
+                walk.m,
+                false,
+            );
+        }
         let split = slot.split(slot.b, slot.fold_mask(|band| masks[band] as u32), frame.lm);
         let lowband = walk.lowband(&slot, &norm_hist);
         let band_x = &mut x[slot.band_start..slot.band_start + slot.n];
@@ -1545,9 +1555,41 @@ pub(crate) fn denormalise_bands(
         let j0 = m * mode.e_bands[i] as usize;
         let j1 = m * mode.e_bands[i + 1] as usize;
         let lg = loge + quant_bands::e_means()[i];
-        let g = 2.0f32.powf(lg.max(DENORMALISE_LOG_GAIN_BOUND));
+        let g = 2.0f32.powf(lg.min(DENORMALISE_MAX_LOG_GAIN));
         for j in j0..j1 {
             freq[j] = x[j] * g;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::denormalise_bands;
+    use crate::celt::modes::mode48000_960_120;
+    use crate::celt::quant_bands::e_means;
+
+    /// Logaritmo de ganancia muy por encima de la cota de libopus.
+    const LG_HIGH: f32 = 100.0;
+    /// Logaritmo de ganancia por debajo de −32, que libopus no limita.
+    const LG_LOW: f32 = -40.0;
+
+    /// Como `denormalise_bands` de libopus en coma flotante (`celt_exp2_db(MIN32(32.f, lg))`): la
+    /// ganancia se limita a 2^32 por arriba y no se limita por abajo.
+    #[test]
+    fn denormalise_bounds_log_gain_like_libopus() {
+        let mode = mode48000_960_120();
+        let len = mode.e_bands[2] as usize;
+        let x = vec![1.0f32; len];
+        let mut freq = vec![0.0f32; len];
+        let mut band_loge = vec![0.0f32; mode.nb_ebands];
+        band_loge[0] = LG_HIGH - e_means()[0];
+        band_loge[1] = LG_LOW - e_means()[1];
+
+        denormalise_bands(mode, &x, &mut freq, &band_loge, 0..2, 0);
+
+        let band0 = mode.e_bands[0] as usize..mode.e_bands[1] as usize;
+        let band1 = mode.e_bands[1] as usize..len;
+        assert!(freq[band0].iter().all(|&g| g == 2.0f32.powi(32)));
+        assert!(freq[band1].iter().all(|&g| g == 2.0f32.powf(LG_LOW)));
     }
 }

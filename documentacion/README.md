@@ -22,6 +22,7 @@ Toda modificación del código se acepta solo si:
 1. Las pruebas, clippy (`-D warnings`), `cargo fmt --check` y `cargo audit` pasan en Windows y
    Linux.
 2. Los 12 vectores de RFC 8251 pasan la comparación de calidad de `opus_compare`.
-3. La red de equivalencia (`tests/red_equivalencia.rs`) da las 110 huellas de
-   [`red/huellas.txt`](../red/huellas.txt), generadas con la 0.1.1 original. Una huella distinta
-   significa que la salida cambió en al menos una muestra.
+3. La red de equivalencia (`tests/red_equivalencia.rs`) da las 111 huellas de
+   [`red/huellas.txt`](../red/huellas.txt), generadas con la 0.1.1 original salvo las que cambia a
+   propósito cada corrección (listadas en el historial de cambios). Una huella distinta significa
+   que la salida cambió en al menos una muestra.

@@ -3,6 +3,74 @@
 Cambios de Copus_Decoder respecto a `opus-decoder` 0.1.1. El historial de git conserva cada paso
 por separado, empezando por el paquete original intacto.
 
+## 0.1.1 — 2026-10-26
+
+### Corrección
+
+- **Plegado de la primera banda en las tramas híbridas mono.** Como `quant_all_bands` de libopus
+  (`celt/bands.c`), la banda `start + 1` se pliega ahora también con un solo canal codificado;
+  antes solo se hacía en estéreo y, en mono, esa banda plegaba desde un historial a cero. Medido
+  con los vectores de RFC 8251 a 48 kHz en estéreo frente a la salida de referencia: solo cambian
+  los vectores con tramas híbridas mono, que se acercan a ella (suma de errores absolutos de
+  144 009 a 1 221 en el 05, de 411 909 a 4 351 en el 06 y de 1 015 842 a 950 en el 12; error
+  máximo de 67, 232 y 242 a 2, 10 y 10); los otros nueve no cambian. La red de equivalencia se
+  regenera solo en las 28 huellas de esos tres vectores y del multiflujo `tv05+tv12`.
+- **Reinicio del canal lateral de SILK al volver de una trama solo con el canal medio.** Como
+  `silk_Decode` de libopus (`silk/dec_API.c`), cuando una trama estéreo vuelve a traer canal
+  lateral tras otra que solo traía el medio, se borran la salida reciente y la memoria LPC de ese
+  canal, el retardo de tono, el último índice de ganancia y el tipo de señal anterior vuelven a sus
+  valores iniciales y la trama siguiente no interpola las NLSF. Medido igual que el anterior, ya
+  con él aplicado: solo cambian los vectores 05, 06 y 10, que se acercan a la referencia (suma de
+  errores absolutos de 1 221 a 1 161 en el 05, de 4 351 a 1 286 en el 06 y de 891 166 a 835 041
+  en el 10; el error máximo del 05 y el 06 baja a 1).
+- **Reinicio de SILK al pasar de solo CELT a híbrido.** libopus reinicia el decodificador SILK
+  siempre que el paquete anterior era solo CELT (`opus_decode_frame`, `src/opus_decoder.c`); el
+  original solo lo hacía si el paquete nuevo era solo SILK. Los vectores tienen 8 transiciones de
+  solo CELT a híbrido, todas en el 10: es el único que cambia, y su suma de errores absolutos
+  frente a la referencia baja de 835 041 a 40 075 (error máximo de 66 a 33).
+- **Índice de tono de la ocultación SILK, circular de verdad.** `plc_pitch_sample` calculaba la
+  muestra anterior en un tono con una resta con vuelta en `usize` seguida del módulo, que solo da
+  el índice circular si la longitud de la trama guardada es potencia de dos; con tramas de 160,
+  240 o 320 muestras leía otra muestra cuando la posición era menor que el tono. Ahora el índice
+  es circular para cualquier longitud (prueba con oráculo, que fallaba con el código anterior).
+  Solo afecta a la ocultación de pérdidas; los vectores de RFC 8251 no tienen pérdidas y su
+  salida no cambia.
+- **Primera trama de cada paquete SILK siempre independiente.** Como `silk_Decode` de libopus, la
+  primera trama del paquete se decodifica como `CODE_INDEPENDENTLY` también en el canal lateral
+  cuando la trama anterior solo traía el medio; antes se usaba
+  `CODE_INDEPENDENTLY_NO_LTP_SCALING` y, si la trama era sonora, no se leía el índice de escala
+  LTP y el resto del paquete se leía desplazado. En los vectores el caso ocurre 4 veces, siempre
+  en tramas sordas, y su salida no cambia; sí ocurre en tramas sonoras con paquetes dañados.
+- **`silk_log2lin` trunca como libopus.** En la rama de entradas menores que 2048 (16 en Q7),
+  libopus suma `(out * curva) >> 7` sin redondeo (`silk_ADD_RSHIFT32`); aquí se redondeaba.
+  Comprobado con un oráculo de la fórmula de libopus en todas las entradas de −1 a 4000, que
+  fallaba con el código anterior. El único llamador nunca entra en esa rama: la salida no cambia.
+- **Cota de la ganancia al desnormalizar las bandas de CELT, como libopus.** libopus limita por
+  arriba el logaritmo de la ganancia (`celt_exp2_db(MIN32(32.f, lg))`, que en coma flotante es
+  `celt_exp2`); aquí se limitaba por abajo, a −32, y por arriba la ganancia podía crecer sin
+  límite. Medido: en los 12 vectores, con pérdidas y con paquetes dañados, ninguna banda sale de
+  ±32 (extremos 28,5 y −24,5), así que la salida no cambia.
+
+### Pruebas
+
+- **La conformidad con RFC 8251 exige `final_range`.** Antes solo avisaba si el estado final del
+  decodificador de rango de un paquete no coincidía con el de referencia, y el aviso ni se veía
+  cuando la prueba pasaba. Medido: quitar la mezcla del rango de la trama CELT redundante en las
+  tramas solo SILK cambia el `final_range` de 14 paquetes (vectores 08, 09 y 12) sin tocar el PCM,
+  y la prueba anterior seguía en verde; ahora falla, igual que si se quita en las tramas híbridas
+  (vector 10). Con el decodificador actual coincide en todos los paquetes de los 12 vectores.
+- **La red de equivalencia cubre las transiciones de solo CELT a solo SILK.** Los vectores de RFC
+  8251 no tienen ninguna; el caso nuevo `transiciones tv01+tv02` alterna bloques de 50 paquetes de
+  un vector solo CELT y otro solo SILK. Sin el reinicio de SILK en esa transición, la red se pone
+  en rojo. Las otras 110 huellas no cambian.
+
+### Diseño
+
+- **La cola de redundancia de las tramas solo SILK se lee en `src/decoder.rs`**, junto a la de las
+  híbridas, como en `opus_decode_frame` de libopus (RFC 6716 §4.5.1). SILK ya no depende del
+  decodificador de paquetes. El orden de lectura no cambia (carga SILK, cola, cierre), así que la
+  salida y el `final_range` son idénticos.
+
 ## 0.1.0 — 2026-10-26
 
 ### Corrección

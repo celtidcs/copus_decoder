@@ -5,7 +5,7 @@
 
 use crate::Error;
 use crate::entropy::EcDec;
-use crate::packet::{BITS_PER_BYTE, DURATIONS_PER_BANDWIDTH, OPUS_RATE_HZ, SILK_FRAME_SAMPLES_48K};
+use crate::packet::{DURATIONS_PER_BANDWIDTH, OPUS_RATE_HZ, SILK_FRAME_SAMPLES_48K};
 use tables::{
     FS_KHZ_MB, FS_KHZ_NB, FS_KHZ_WB, HZ_PER_KHZ, ICDF_FTB, MAX_NB_SUBFR, NB_SUBFR_10MS,
     NLSF_INTERP_NONE_Q2, ONE_Q16, SUB_FRAME_LENGTH_MS, TYPE_VOICED,
@@ -36,19 +36,6 @@ const MAX_API_FRAME_SAMPLES_48K: usize = 960 * MAX_INTERNAL_FRAMES;
 
 /// Muestras de PCM interno que caben en un paquete: tres tramas internas de la mayor longitud.
 const INTERNAL_PCM_LEN: usize = MAX_INTERNAL_FRAMES * tables::MAX_FRAME_LENGTH;
-
-/// Resultado de decodificar una trama Opus solo SILK.
-#[derive(Debug, Clone, Copy)]
-pub(crate) struct SilkFrameDecode {
-    /// Muestras decodificadas por canal de salida.
-    pub samples_per_channel: usize,
-    /// Si la trama lleva una cola de redundancia CELT.
-    pub consumed_redundancy: bool,
-    /// Bytes del final de la trama que ocupa la redundancia CELT.
-    pub redundancy_bytes: usize,
-    /// Sentido de la transición que anuncia la cola de redundancia (de CELT a SILK).
-    pub celt_to_silk: bool,
-}
 
 /// Lo que el TOC dice de una trama SILK: su duración, su configuración y los canales codificados.
 #[derive(Debug, Clone, Copy)]
@@ -137,6 +124,14 @@ impl SilkChannel {
             self.first_frame_after_reset = true;
         }
         indices::configure_channel_state(&mut self.indices, fs_khz, nb_subfr);
+    }
+
+    /// Reinicia el canal lateral al volver a codificarse tras una trama solo de medio
+    /// (`silk_Decode` de libopus): su síntesis empieza de cero y la siguiente trama no
+    /// interpola las NLSF.
+    fn reset_side_after_mid_only(&mut self) {
+        self.core.reset_side_after_mid_only();
+        self.first_frame_after_reset = true;
     }
 
     /// Crea el remuestreador de `internal_fs_hz` a `api_fs_hz` si no existe o convierte otras
@@ -488,27 +483,6 @@ impl SilkDecoder {
         );
     }
 
-    /// Decodifica una trama Opus solo SILK y su posible cola de redundancia CELT.
-    ///
-    /// # Errores
-    ///
-    /// Los de [`Self::decode_frame_with_ec`].
-    pub fn decode_frame(
-        &mut self,
-        frame: &[u8],
-        request: SilkFrameRequest,
-        out: &mut [i16],
-    ) -> Result<SilkFrameDecode, Error> {
-        let mut dec = EcDec::new(frame);
-        let samples_per_channel = self.decode_payload(&mut dec, request, out)?;
-        let trailer = read_redundancy_trailer(&mut dec, frame);
-        self.finish(&dec)?;
-        Ok(SilkFrameDecode {
-            samples_per_channel,
-            ..trailer
-        })
-    }
-
     /// Decodifica la parte SILK de una trama híbrida con el decodificador de rango compartido
     /// `dec`, que la capa CELT sigue leyendo después. Devuelve las muestras por canal de salida.
     ///
@@ -527,12 +501,13 @@ impl SilkDecoder {
         Ok(samples_per_channel)
     }
 
-    /// Guarda el estado final del decodificador de rango.
+    /// Cierra una trama: guarda el estado final del decodificador de rango. En las tramas solo
+    /// SILK el llamador lo llama tras leer la cola de redundancia.
     ///
     /// # Errores
     ///
     /// `BadPacket` si la lectura se salió de la trama.
-    fn finish(&mut self, dec: &EcDec<'_>) -> Result<(), Error> {
+    pub(crate) fn finish(&mut self, dec: &EcDec<'_>) -> Result<(), Error> {
         self.final_range = dec.final_range();
         if dec.is_error() {
             return Err(Error::BadPacket);
@@ -540,13 +515,14 @@ impl SilkDecoder {
         Ok(())
     }
 
-    /// Decodifica las tramas internas del paquete y escribe su PCM en `out`. No toca el estado
-    /// final del decodificador de rango, que se guarda al terminar la trama.
+    /// Decodifica las tramas internas del paquete y escribe su PCM en `out`; devuelve las muestras
+    /// por canal de salida. No cierra la trama: el llamador lee lo que quede (la cola de
+    /// redundancia de una trama solo SILK) y llama a [`Self::finish`].
     ///
     /// # Errores
     ///
     /// Los de [`Self::decode_frame_with_ec`] salvo el de lectura fuera de la trama.
-    fn decode_payload(
+    pub(crate) fn decode_payload(
         &mut self,
         dec: &mut EcDec<'_>,
         request: SilkFrameRequest,
@@ -666,6 +642,9 @@ impl SilkDecoder {
         if packet_channels == 2 {
             pred_q13 = stereo::decode_stereo_pred(dec);
             decode_only_middle = !header.channels[1].vad_flags[i] && stereo::decode_mid_only(dec);
+            if !decode_only_middle && self.prev_decode_only_middle {
+                self.channel_state[1].reset_side_after_mid_only();
+            }
         }
 
         let mut pending: [Option<PlcUpdate>; 2] = [None, None];
@@ -716,36 +695,17 @@ impl SilkDecoder {
     }
 }
 
-/// Codificación condicional de la trama interna `i` del canal `ch`: el canal lateral que sigue a
-/// una trama solo de medio no escala el LTP; la primera trama del paquete no se condiciona y las
-/// demás se condicionan a la anterior.
+/// Codificación condicional de la trama interna `i` del canal `ch`, en el orden de `silk_Decode`
+/// de libopus: la primera trama del paquete nunca se condiciona; después, el canal lateral que
+/// sigue a una trama solo de medio no escala el LTP, y las demás se condicionan a la anterior.
 fn main_cond_coding(i: usize, ch: usize, prev_decode_only_middle: bool) -> indices::CondCoding {
-    if ch > 0 && prev_decode_only_middle {
-        indices::CondCoding::IndependentlyNoLtpScaling
-    } else if i == 0 {
+    if i == 0 {
         indices::CondCoding::Independently
+    } else if ch > 0 && prev_decode_only_middle {
+        indices::CondCoding::IndependentlyNoLtpScaling
     } else {
         indices::CondCoding::Conditionally
     }
-}
-
-/// Lee la cola de redundancia de una trama solo SILK (RFC 6716 §4.5.1): un bit de sentido y,
-/// en los bytes que queden, la trama CELT redundante. Sin bits suficientes no hay redundancia.
-fn read_redundancy_trailer(dec: &mut EcDec<'_>, frame: &[u8]) -> SilkFrameDecode {
-    let mut trailer = SilkFrameDecode {
-        samples_per_channel: 0,
-        consumed_redundancy: false,
-        redundancy_bytes: 0,
-        celt_to_silk: false,
-    };
-    if dec.tell() + crate::decoder::REDUNDANCY_MIN_BITS <= (BITS_PER_BYTE * frame.len()) as i32 {
-        trailer.celt_to_silk = dec.dec_bit_logp(1);
-        trailer.redundancy_bytes = frame
-            .len()
-            .saturating_sub((dec.tell().max(0) as usize).div_ceil(BITS_PER_BYTE));
-        trailer.consumed_redundancy = trailer.redundancy_bytes > 0;
-    }
-    trailer
 }
 
 /// Remuestrea `pcm` trama interna a trama interna de `frame_length` muestras en `out`. Con
@@ -1009,6 +969,51 @@ mod tests {
     use crate::test_vectors::{read_opus_demo_records, vectors_dir};
 
     const TV02_PKT0_LPC_Q12: [i16; 10] = [5041, -1246, 1017, -614, 431, -560, 131, -357, 284, -46];
+
+    /// El reinicio del canal lateral tras una trama solo de medio hace que la trama siguiente no
+    /// interpole las NLSF, como `first_frame_after_reset = 1` en `silk_Decode`. Ni la red de
+    /// equivalencia ni los vectores lo distinguen (medido: quitarlo no cambia ninguna salida).
+    #[test]
+    fn side_reset_after_mid_only_skips_nlsf_interpolation() {
+        let mut channel = SilkChannel {
+            first_frame_after_reset: false,
+            ..SilkChannel::default()
+        };
+        channel.reset_side_after_mid_only();
+        assert!(channel.first_frame_after_reset);
+    }
+
+    /// Codificación condicional que elige `silk_Decode` de libopus (sin LBRR), como oráculo:
+    /// la primera trama del paquete siempre independiente; después, el canal lateral que sigue a
+    /// una trama solo de medio sin escala LTP; el resto, condicionada.
+    fn libopus_cond_coding(
+        i: usize,
+        ch: usize,
+        prev_decode_only_middle: bool,
+    ) -> indices::CondCoding {
+        if i == 0 {
+            indices::CondCoding::Independently
+        } else if ch > 0 && prev_decode_only_middle {
+            indices::CondCoding::IndependentlyNoLtpScaling
+        } else {
+            indices::CondCoding::Conditionally
+        }
+    }
+
+    #[test]
+    fn main_cond_coding_matches_libopus() {
+        for i in 0..MAX_INTERNAL_FRAMES {
+            for ch in 0..2 {
+                for prev in [false, true] {
+                    assert_eq!(
+                        main_cond_coding(i, ch, prev),
+                        libopus_cond_coding(i, ch, prev),
+                        "trama {i}, canal {ch}, anterior solo medio: {prev}"
+                    );
+                }
+            }
+        }
+    }
 
     #[test]
     fn maps_internal_frame_counts() {

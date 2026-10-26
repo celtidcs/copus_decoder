@@ -1,8 +1,9 @@
 //! Red de equivalencia: huella de la salida completa del decodificador sobre los 12 vectores
 //! oficiales de RFC 8251, en varias frecuencias y números de canales, con pérdida de paquetes,
-//! con paquetes dañados y en multiflujo. Las huellas de `red/huellas.txt` salen de la versión
-//! 0.1.1 original (más el parche, que no cambia la salida); toda refactorización debe dejarlas
-//! idénticas.
+//! con paquetes dañados, en multiflujo y con transiciones de modo. Las huellas de `red/huellas.txt` salen de la versión
+//! 0.1.1 original (más el parche, que no cambia la salida), salvo las que cambia a propósito una
+//! corrección, listadas en `documentacion/historial-de-cambios.md`; toda refactorización debe
+//! dejarlas idénticas.
 //!
 //! Ejecución: `OPUS_TESTVECTORS_DIR=<carpeta> cargo test --release --test red_equivalencia -- --ignored`.
 //! Con `RED_ESCRIBIR=1` reescribe `red/huellas.txt` en vez de comparar (solo para fijar la base).
@@ -31,6 +32,9 @@ const PERIODO_DE_PERDIDA: usize = 9;
 const PERIODO_DE_DANO: usize = 5;
 /// Bytes cambiados en cada paquete dañado.
 const BYTES_DANADOS: usize = 3;
+/// Paquetes de cada bloque en el caso de transiciones de modo: un segundo de audio con tramas de
+/// 20 ms, para que cada modo llegue a estabilizarse antes del siguiente cambio.
+const BLOQUE_DE_TRANSICION: usize = 50;
 
 /// Huella FNV-1a de 64 bits: detecta cualquier cambio de la salida (no es criptográfica ni lo
 /// necesita: compara una versión del código con otra, no se defiende de nadie).
@@ -146,6 +150,16 @@ fn huella_multiflujo(a: &[Vec<u8>], b: &[Vec<u8>]) -> u64 {
     huella.0
 }
 
+/// Bloques alternos de `BLOQUE_DE_TRANSICION` paquetes de `a` y de `b`, hasta agotar el más corto:
+/// cada cambio de bloque es una transición de modo entre los dos vectores.
+fn alternar(a: &[Vec<u8>], b: &[Vec<u8>]) -> Vec<Vec<u8>> {
+    a.chunks(BLOQUE_DE_TRANSICION)
+        .zip(b.chunks(BLOQUE_DE_TRANSICION))
+        .flat_map(|(x, y)| x.iter().chain(y))
+        .cloned()
+        .collect()
+}
+
 /// Paquetes de un vector; los marcados como perdidos en el flujo oficial pasan vacíos.
 fn paquetes(numero: usize) -> Vec<Vec<u8>> {
     let ruta = vectors_dir().join(format!("testvector{numero:02}.bit"));
@@ -179,6 +193,15 @@ fn calcular_huellas() -> String {
         let h = huella_multiflujo(&todos[a - 1], &todos[b - 1]);
         writeln!(lineas, "multiflujo tv{a:02}+tv{b:02} {h:016x}").unwrap();
     }
+    // Los vectores no pasan nunca de solo CELT a solo SILK: tv01 es solo CELT y tv02 solo SILK.
+    let (a, b) = (1usize, 2usize);
+    let h = huella_float(
+        &alternar(&todos[a - 1], &todos[b - 1]),
+        48_000,
+        2,
+        Modo::Normal,
+    );
+    writeln!(lineas, "transiciones tv{a:02}+tv{b:02} {h:016x}").unwrap();
     lineas
 }
 
@@ -186,9 +209,11 @@ fn ruta_huellas() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("red/huellas.txt")
 }
 
+/// La salida coincide, huella a huella, con `red/huellas.txt`: las de la 0.1.1 original salvo las
+/// que una corrección cambió a propósito (listadas en el historial de cambios).
 #[test]
 #[ignore = "necesita OPUS_TESTVECTORS_DIR con los vectores de RFC 8251 (ver documentacion/infraestructura)"]
-fn la_salida_es_identica_a_la_de_la_version_original() {
+fn la_salida_coincide_con_las_huellas() {
     let actuales = calcular_huellas();
     if std::env::var("RED_ESCRIBIR").as_deref() == Ok("1") {
         std::fs::write(ruta_huellas(), &actuales).unwrap();

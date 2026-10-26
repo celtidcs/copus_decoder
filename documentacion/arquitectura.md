@@ -23,8 +23,9 @@ El decodificador sigue la estructura de libopus función a función, en la ruta 
 Esa cercanía es deliberada: permite contrastar cada función con la implementación de referencia,
 y es la base de la conformidad bit a bit del estado del decodificador de rango (`final_range`).
 Las capas dependen hacia abajo: `lib.rs` usa `decoder.rs`, que usa CELT, SILK, `packet.rs`,
-`entropy.rs` y `pcm.rs`; `multistream.rs` usa un `OpusDecoder` por flujo y `packet.rs`. La única excepción conocida está en
-[defectos conocidos](defectos-conocidos.md) (la cola de redundancia de SILK).
+`entropy.rs` y `pcm.rs`; `multistream.rs` usa un `OpusDecoder` por flujo y `packet.rs`. Ninguna
+capa inferior depende de `decoder.rs`: las colas de redundancia de las tramas solo SILK e híbridas
+se leen allí, como en `opus_decode_frame` de libopus.
 
 ## Flujo de un paquete
 
@@ -45,7 +46,7 @@ Las capas dependen hacia abajo: `lib.rs` usa `decoder.rs`, que usa CELT, SILK, `
 | `tests/multistream.rs` | Mapa de canales, topologías no válidas y equivalencia del multiflujo con un decodificador por flujo. |
 | `tests/no_panico.rs` | Entradas aleatorias y mutadas: siempre `Ok` o `Err`, nunca un pánico. |
 | `tests/conformance_rfc.rs` | Los 12 vectores de RFC 8251 con `opus_compare` (`tests/compare/`). |
-| `tests/red_equivalencia.rs` | 110 huellas de la salida completa frente a la 0.1.1 original. |
+| `tests/red_equivalencia.rs` | 111 huellas de la salida completa (con un caso de transiciones de solo CELT a solo SILK): las de la 0.1.1 original salvo las que cambia a propósito una corrección. |
 
 `tests/common/mod.rs` reúne la lectura de vectores que comparten las pruebas de integración. Las
 pruebas que necesitan los vectores de RFC 8251 están marcadas `#[ignore]` porque dependen de
@@ -63,6 +64,7 @@ datos externos; la [guía de clonado](infraestructura/guia-de-clonado.md) explic
 - **La red de equivalencia antes de refactorizar.** Las huellas se generaron con la 0.1.1 original
   antes de tocar nada; una refactorización solo se acepta si las deja idénticas. Se comprobó que la
   red detecta un cambio relativo de una millonésima en la recurrencia de desénfasis de CELT
-  (`apply_deemph`).
+  (`apply_deemph`). Una corrección que cambia la salida a propósito regenera solo las huellas que
+  cambia, tras comprobar que la salida se acerca a la de referencia de RFC 8251.
 - **Sin `criterion`.** Era una dependencia de desarrollo solo para bancos de velocidad que el
   paquete publicado no incluye.

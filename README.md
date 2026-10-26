@@ -52,7 +52,9 @@ Esta copia:
 2. **Demuestra que la salida no cambia**: los 12 vectores oficiales de RFC 8251 siguen pasando, y
    una red de 110 huellas de la salida completa (6 combinaciones de frecuencia y canales, pérdida
    de paquetes, paquetes dañados, salida `i16` y multiflujo) da exactamente lo mismo que la 0.1.1
-   original.
+   original. Desde la 0.1.1 de Copus_Decoder, las correcciones que acercan la salida a libopus
+   cambian a propósito solo las huellas afectadas (detalle en el historial de cambios), y la red
+   suma una huella de transiciones de solo CELT a solo SILK (111 en total).
 3. **Audita el código** (sin valores incrustados, refactorización, piezas de una sola
    responsabilidad y principios SOLID), con esa misma red como garantía de que cada cambio deja
    la salida idéntica.

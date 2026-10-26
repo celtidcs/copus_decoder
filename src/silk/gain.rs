@@ -1,6 +1,6 @@
 //! Decuantificación de las ganancias de SILK.
 
-use super::fixed::{rshift_round, smlawb, smulbb, smulwb};
+use super::fixed::{smlawb, smulbb, smulwb};
 use super::tables::{MAX_DELTA_GAIN_QUANT, MIN_DELTA_GAIN_QUANT, N_LEVELS_QGAIN};
 
 const MIN_QGAIN_DB: i32 = 2;
@@ -72,14 +72,47 @@ fn log2lin(in_log_q7: i32) -> i32 {
         LOG2LIN_CURVE_COEF,
     );
     if in_log_q7 < LOG2LIN_SMALL_OUTPUT_Q7 {
-        out = add_rshift32(out, out.saturating_mul(curve), 7);
+        // `silk_ADD_RSHIFT32`: desplazamiento sin redondeo. Aquí `out` < 2^16 y `curve` < 128,
+        // así que las operaciones saturadas nunca saturan y coinciden con las de libopus.
+        out = out.saturating_add(out.saturating_mul(curve) >> 7);
     } else {
         out = out.saturating_add((out >> 7).saturating_mul(curve));
     }
     out
 }
 
-/// `a` más `b` desplazado `shift` bits a la derecha con redondeo, con la suma saturada.
-fn add_rshift32(a: i32, b: i32, shift: usize) -> i32 {
-    a.saturating_add(rshift_round(b, shift))
+#[cfg(test)]
+mod tests {
+    use super::log2lin;
+
+    /// `silk_log2lin` de libopus (`silk/log2lin.c`) en `i64`, como oráculo: en la rama de
+    /// entradas menores que 2048 suma `(out * curva) >> 7` sin redondeo (`silk_ADD_RSHIFT32`).
+    fn libopus_log2lin(in_log_q7: i32) -> i32 {
+        if in_log_q7 < 0 {
+            return 0;
+        }
+        if in_log_q7 >= 3967 {
+            return i32::MAX;
+        }
+        let out = 1i64 << (in_log_q7 >> 7);
+        let frac_q7 = i64::from(in_log_q7 & 0x7F);
+        let curve = frac_q7 + ((frac_q7 * (128 - frac_q7) * -174) >> 16);
+        let out = if in_log_q7 < 2048 {
+            out + ((out * curve) >> 7)
+        } else {
+            out + (out >> 7) * curve
+        };
+        out as i32
+    }
+
+    #[test]
+    fn log2lin_matches_libopus() {
+        for in_log_q7 in -1..=4000 {
+            assert_eq!(
+                log2lin(in_log_q7),
+                libopus_log2lin(in_log_q7),
+                "entrada {in_log_q7}"
+            );
+        }
+    }
 }

@@ -186,16 +186,18 @@ pub(super) fn plc_conceal(
 }
 
 /// Muestra de la última trama guardada que repite el tono en la posición `frame_idx` de la trama
-/// ocultada: la de índice `frame_idx - pitch_lag`, con resta con vuelta, módulo la longitud de
-/// la trama guardada. Devuelve cero sin lag o sin trama guardada.
+/// ocultada: la de índice `frame_idx - pitch_lag`, circular en la longitud de la trama guardada.
+/// Devuelve cero sin lag o sin trama guardada.
 fn plc_pitch_sample(plc: &SilkPlcState, frame_idx: usize) -> i32 {
     if plc.pitch_lag <= 0 || plc.last_frame_out.is_empty() {
         return 0;
     }
 
-    let lag = plc.pitch_lag as usize;
     let history_len = plc.last_frame_out.len();
-    let lag_idx = frame_idx.wrapping_sub(lag) % history_len;
+    let lag = plc.pitch_lag as usize % history_len;
+    // Se suma la longitud antes de restar: una resta con vuelta en `usize` seguida del módulo
+    // solo da el índice circular si la longitud divide a 2^64 (potencia de dos).
+    let lag_idx = (frame_idx % history_len + history_len - lag) % history_len;
     plc.last_frame_out[lag_idx] as i32
 }
 
@@ -211,4 +213,42 @@ fn mul_q14_q16(value_q14: i32, value_q16: i32) -> i32 {
 fn lshift_sat32_widened(value: i32, shift: usize) -> i32 {
     let widened = (value as i64) << shift;
     widened.clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{SilkPlcState, plc_pitch_sample};
+
+    /// Longitudes de la trama guardada de las pruebas: las de 10 y 20 ms a 8, 12 y 16 kHz, más
+    /// una potencia de dos, el único caso en que la resta con vuelta ya era circular.
+    const HISTORY_LENS: [usize; 4] = [160, 240, 256, 320];
+
+    /// Índice circular de `frame_idx - lag` en un historial de `history_len`, con enteros con
+    /// signo: el oráculo del contrato de `plc_pitch_sample`.
+    fn circular_index(frame_idx: usize, lag: usize, history_len: usize) -> usize {
+        (frame_idx as i64 - lag as i64).rem_euclid(history_len as i64) as usize
+    }
+
+    /// La muestra devuelta es la de `frame_idx - pitch_lag` en la trama guardada, dando la vuelta
+    /// por el final, para cualquier longitud y para lags de hasta dos veces la trama.
+    #[test]
+    fn pitch_sample_wraps_circularly() {
+        for history_len in HISTORY_LENS {
+            let mut plc = SilkPlcState {
+                last_frame_out: (0..history_len).map(|i| i as i16).collect(),
+                ..SilkPlcState::default()
+            };
+            for lag in 1..=2 * history_len {
+                plc.pitch_lag = lag as i32;
+                for frame_idx in 0..history_len {
+                    let expected = circular_index(frame_idx, lag, history_len) as i32;
+                    assert_eq!(
+                        plc_pitch_sample(&plc, frame_idx),
+                        expected,
+                        "historial {history_len}, lag {lag}, posición {frame_idx}"
+                    );
+                }
+            }
+        }
+    }
 }

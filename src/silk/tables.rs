@@ -14,6 +14,8 @@ pub(super) const FS_KHZ_MB: u32 = 12;
 pub(super) const FS_KHZ_WB: u32 = 16;
 /// Hercios por kilohercio, para pasar de la frecuencia en Hz a la de SILK en kHz.
 pub(super) const HZ_PER_KHZ: u32 = 1000;
+/// Tipo de señal sin actividad de voz (`TYPE_NO_VOICE_ACTIVITY` en libopus).
+pub(super) const TYPE_NO_VOICE_ACTIVITY: i32 = 0;
 /// Tipo de señal sonora (`TYPE_VOICED` en libopus): la única con pitch y LTP.
 pub(super) const TYPE_VOICED: i32 = 2;
 /// Bits de precisión de todas las ICDF de SILK: libopus llama siempre `ec_dec_icdf(..., 8)`.

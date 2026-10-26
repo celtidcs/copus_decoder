@@ -20,7 +20,7 @@ const TWO_AND_HALF_MS_PER_SECOND: usize = 400;
 const REDUNDANT_FRAME_SAMPLES_48K: usize = OPUS_RATE_HZ / FIVE_MS_PER_SECOND;
 /// Bits que deben quedar en la trama para leer la señal de redundancia: 17, y 20 más en híbrido
 /// (`ec_tell(&dec)+17+20*(mode == MODE_HYBRID) <= 8*len` en `opus_decode_frame`).
-pub(crate) const REDUNDANCY_MIN_BITS: i32 = 17;
+const REDUNDANCY_MIN_BITS: i32 = 17;
 const REDUNDANCY_HYBRID_EXTRA_BITS: i32 = 20;
 /// La señal de redundancia híbrida tiene probabilidad 1/2^12 (`ec_dec_bit_logp(&dec, 12)`).
 const REDUNDANCY_FLAG_LOGP: u32 = 12;
@@ -296,7 +296,9 @@ impl Decoder {
                 OpusMode::SilkOnly => {
                     self.decode_silk_only_frame(frame, &ctx, &mut transition, out_frame)?
                 }
-                OpusMode::Hybrid => self.decode_hybrid_frame(frame, &ctx, out_frame)?,
+                OpusMode::Hybrid => {
+                    self.decode_hybrid_frame(frame, &ctx, &mut transition, out_frame)?
+                }
             };
             written_per_channel += last_frame.samples_per_channel;
         }
@@ -384,24 +386,30 @@ impl Decoder {
         transition: &mut PacketTransition,
         out_frame: &mut [i16],
     ) -> Result<FrameOutcome, Error> {
-        if transition.reset_silk {
-            self.silk.reset();
-            transition.reset_silk = false;
-        }
-        let silk_frame = self
-            .silk
-            .decode_frame(frame, ctx.silk_request(), out_frame)?;
+        self.reset_silk_after_celt(transition);
+        let mut ec = EcDec::new(frame);
+        let samples_per_channel =
+            self.silk
+                .decode_payload(&mut ec, ctx.silk_request(), out_frame)?;
+        // La cola se lee antes de cerrar SILK: su estado final de rango incluye esa lectura.
+        let redundancy = read_silk_only_redundancy(&mut ec, frame);
+        self.silk.finish(&ec)?;
         let mut redundancy_rng = 0u32;
-        if silk_frame.consumed_redundancy {
-            let redundancy_data = &frame[frame.len() - silk_frame.redundancy_bytes..];
-            redundancy_rng =
-                self.apply_silk_only_redundancy(redundancy_data, ctx, &silk_frame, out_frame)?;
+        if redundancy.present {
+            let redundancy_data = &frame[frame.len() - redundancy.bytes..];
+            redundancy_rng = self.apply_silk_only_redundancy(
+                redundancy_data,
+                ctx,
+                &redundancy,
+                samples_per_channel,
+                out_frame,
+            )?;
         }
         self.last_final_range = self.silk.final_range() ^ redundancy_rng;
         Ok(FrameOutcome {
-            samples_per_channel: silk_frame.samples_per_channel,
-            had_redundancy: silk_frame.consumed_redundancy && !silk_frame.celt_to_silk,
-            celt_to_silk: silk_frame.celt_to_silk,
+            samples_per_channel,
+            had_redundancy: redundancy.present && !redundancy.celt_to_silk,
+            celt_to_silk: redundancy.celt_to_silk,
         })
     }
 
@@ -412,13 +420,14 @@ impl Decoder {
         &mut self,
         redundancy_data: &[u8],
         ctx: &PacketContext,
-        silk_frame: &silk::SilkFrameDecode,
+        redundancy: &FrameRedundancy,
+        silk_samples: usize,
         out_frame: &mut [i16],
     ) -> Result<u32, Error> {
         let channels = self.channels as usize;
         let overlap = self.samples_2_5ms();
         let mut redundancy_out = vec![0i16; self.samples_5ms() * channels];
-        if !silk_frame.celt_to_silk {
+        if !redundancy.celt_to_silk {
             self.celt.reset();
         }
         self.celt.set_start_band(0);
@@ -432,9 +441,9 @@ impl Decoder {
         )?;
         self.celt.clear_end_band();
         let redundancy_rng = self.celt.final_range();
-        if !silk_frame.celt_to_silk {
-            let silk_tail_start = (silk_frame.samples_per_channel - overlap) * channels;
-            let silk_tail_end = silk_frame.samples_per_channel * channels;
+        if !redundancy.celt_to_silk {
+            let silk_tail_start = (silk_samples - overlap) * channels;
+            let silk_tail_end = silk_samples * channels;
             let redundancy_start = overlap * channels;
             let redundancy_end = redundancy_start + overlap * channels;
             let silk_tail = out_frame[silk_tail_start..silk_tail_end].to_vec();
@@ -448,7 +457,7 @@ impl Decoder {
                 self.fs_hz,
             );
         } else {
-            let frame_len = silk_frame.samples_per_channel * channels;
+            let frame_len = silk_samples * channels;
             apply_transition_fade_i16(
                 &redundancy_out,
                 &mut out_frame[..frame_len],
@@ -461,14 +470,27 @@ impl Decoder {
         Ok(redundancy_rng)
     }
 
-    /// Decodifica una trama híbrida: SILK, la cabecera de redundancia, la redundancia CELT→SILK si
-    /// la hay, la capa CELT desde la banda 17 y, por último, la redundancia SILK→CELT.
+    /// Reinicia SILK en la primera trama de un paquete solo SILK o híbrido que sigue a uno solo
+    /// CELT, como `opus_decode_frame` de libopus (`silk_ResetDecoder` si `prev_mode` era
+    /// `MODE_CELT_ONLY`).
+    fn reset_silk_after_celt(&mut self, transition: &mut PacketTransition) {
+        if transition.reset_silk {
+            self.silk.reset();
+            transition.reset_silk = false;
+        }
+    }
+
+    /// Decodifica una trama híbrida: SILK (reiniciado si el paquete anterior era solo CELT), la
+    /// cabecera de redundancia, la redundancia CELT→SILK si la hay, la capa CELT desde la banda 17
+    /// y, por último, la redundancia SILK→CELT.
     fn decode_hybrid_frame(
         &mut self,
         frame: &[u8],
         ctx: &PacketContext,
+        transition: &mut PacketTransition,
         out_frame: &mut [i16],
     ) -> Result<FrameOutcome, Error> {
+        self.reset_silk_after_celt(transition);
         let channels = self.channels as usize;
         let mut ec = EcDec::new(frame);
         let silk_samples =
@@ -641,9 +663,11 @@ struct FrameOutcome {
     celt_to_silk: bool,
 }
 
-/// Cabecera de redundancia de una trama híbrida.
-struct HybridRedundancy {
+/// Cola o cabecera de redundancia de una trama solo SILK o híbrida (RFC 6716 §4.5.1).
+struct FrameRedundancy {
+    /// La trama lleva una trama CELT redundante.
     present: bool,
+    /// Sentido de la transición que anuncia la redundancia (de CELT a SILK).
     celt_to_silk: bool,
     /// Bytes de redundancia al final de la trama; 0 si no hay.
     bytes: usize,
@@ -660,9 +684,31 @@ fn mode_for_config(config: u8) -> OpusMode {
     }
 }
 
+/// Lee la cola de redundancia de una trama solo SILK (`opus_decode_frame`): si quedan al menos
+/// `REDUNDANCY_MIN_BITS`, un bit de sentido y, en los bytes que queden, la trama CELT redundante.
+/// El sentido se lee aunque no quede ningún byte para la redundancia.
+fn read_silk_only_redundancy(ec: &mut EcDec<'_>, frame: &[u8]) -> FrameRedundancy {
+    if ec.tell() + REDUNDANCY_MIN_BITS > (frame.len() * BITS_PER_BYTE) as i32 {
+        return FrameRedundancy {
+            present: false,
+            celt_to_silk: false,
+            bytes: 0,
+        };
+    }
+    let celt_to_silk = ec.dec_bit_logp(1);
+    let bytes = frame
+        .len()
+        .saturating_sub((ec.tell().max(0) as usize).div_ceil(BITS_PER_BYTE));
+    FrameRedundancy {
+        present: bytes > 0,
+        celt_to_silk,
+        bytes,
+    }
+}
+
 /// Lee la cabecera de redundancia de una trama híbrida (`opus_decode_frame`) y recorta el
 /// decodificador de rango para que la capa CELT no lea los bytes de la redundancia.
-fn read_hybrid_redundancy(ec: &mut EcDec<'_>, frame: &[u8]) -> HybridRedundancy {
+fn read_hybrid_redundancy(ec: &mut EcDec<'_>, frame: &[u8]) -> FrameRedundancy {
     let mut redundancy = if ec.tell() + REDUNDANCY_MIN_BITS + REDUNDANCY_HYBRID_EXTRA_BITS
         <= (frame.len() * BITS_PER_BYTE) as i32
     {
@@ -693,7 +739,7 @@ fn read_hybrid_redundancy(ec: &mut EcDec<'_>, frame: &[u8]) -> HybridRedundancy 
         }
         ec.shrink_storage(redundancy_bytes);
     }
-    HybridRedundancy {
+    FrameRedundancy {
         present: redundancy,
         celt_to_silk,
         bytes: redundancy_bytes,

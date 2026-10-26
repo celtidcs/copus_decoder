@@ -7,6 +7,10 @@ use std::path::{Path, PathBuf};
 use common::{read_opus_demo_records, vectors_dir};
 use copus_decoder::{OpusDecoder, OpusError};
 
+/// Paquetes con `final_range` distinto que se citan en el mensaje de fallo; bastan para empezar
+/// a investigar sin inundar la salida.
+const MAX_REPORTED_FINAL_RANGE_MISMATCHES: usize = 8;
+
 #[derive(Debug)]
 struct Vector {
     name: String,
@@ -316,15 +320,23 @@ fn run_vector(vectors_dir: &Path, v: &Vector) -> Result<(), Box<dyn std::error::
         }
     }
 
+    // El estado final del decodificador de rango debe coincidir en todos los paquetes: un
+    // desajuste indica que se leyó el flujo de bits de otra forma, aunque el PCM pase la medida
+    // de calidad.
     if !final_range_mismatches.is_empty() {
-        eprintln!(
-            "warning: final_range mismatches for {}: {} packets (soft check for now)",
-            v.name,
-            final_range_mismatches.len()
-        );
-        for (packet_idx, expected, got) in final_range_mismatches.iter().take(8) {
-            eprintln!("  packet #{packet_idx}: expected 0x{expected:08x}, got 0x{got:08x}");
-        }
+        let first: Vec<String> = final_range_mismatches
+            .iter()
+            .take(MAX_REPORTED_FINAL_RANGE_MISMATCHES)
+            .map(|(packet_idx, expected, got)| {
+                format!("#{packet_idx}: expected 0x{expected:08x}, got 0x{got:08x}")
+            })
+            .collect();
+        return Err(format!(
+            "final_range mismatch in {} packets; first: {}",
+            final_range_mismatches.len(),
+            first.join("; ")
+        )
+        .into());
     }
 
     // Camino rápido: coincidencia exacta con alguna de las dos salidas de referencia.
