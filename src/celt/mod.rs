@@ -3,6 +3,8 @@
 //!
 //! Sigue de cerca la estructura de `celt_decoder.c` de libopus para conservar la conformidad.
 
+use std::ops::Range;
+
 use crate::Error;
 use crate::entropy::{BITRES, EcDec};
 use crate::packet::{BITS_PER_BYTE, CELT_FRAME_SAMPLES_48K, OPUS_RATE_HZ, celt_end_band};
@@ -13,12 +15,17 @@ mod bands;
 mod cwrs;
 mod kiss_fft;
 mod laplace;
+mod lpc;
 mod mdct;
 mod modes;
+mod pitch;
+mod plc;
 mod quant_bands;
 mod rate;
+mod static_tables;
 mod synthesis;
 mod vq;
+mod x86_kernels;
 
 const NBANDS_48K_20MS: usize = 21;
 const LOG_ENERGY_FLOOR_DB: f32 = -28.0;
@@ -36,8 +43,6 @@ const SPREAD_ICDF: [u8; 4] = [25, 23, 2, 0];
 const TAPSET_ICDF: [u8; 3] = [2, 1, 0];
 /// LM máximo: tramas de 20 ms.
 const MAX_LM: usize = 3;
-/// La MDCT inversa de una trama produce el doble de muestras que coeficientes (solapamiento).
-const MDCT_SIZE_PER_FRAME_SAMPLE: usize = 2;
 /// Probabilidad 1/2^15 de la señal de silencio (RFC 6716 §4.3, Tabla 56; `ec_dec_bit_logp(dec, 15)`
 /// en `celt_decode_with_ec`).
 const SILENCE_LOGP: u32 = 15;
@@ -73,16 +78,10 @@ const ALLOC_TRIM_DEFAULT: i32 = 5;
 /// (`LM>=2 && bits>=((LM+2)<<BITRES)`).
 const ANTI_COLLAPSE_MIN_LM: usize = 2;
 const ANTI_COLLAPSE_LM_MARGIN: i32 = 2;
-/// Crecimiento máximo de la energía de fondo: 0,001 por bloque corto, hasta 160 bloques
-/// (`IMIN(160, M)*QCONST16(0.001f, DB_SHIFT)`).
+/// Crecimiento máximo de la energía de fondo: 0,001 por bloque corto de la trama y de las
+/// pérdidas anteriores, hasta 160 bloques (`IMIN(160, st->loss_duration+M)*GCONST(0.001f)`).
 const BACKGROUND_MAX_INCREASE_BLOCKS: usize = 160;
 const BACKGROUND_INCREASE_PER_BLOCK: f32 = 0.001;
-/// Atenuación de la energía, en log2, por cada pérdida consecutiva al ocultar con ruido.
-/// Heredada de la implementación original; **no comprobada** contra libopus.
-const PLC_NOISE_ENERGY_DECAY: f32 = 6.0;
-/// Desplazamiento que convierte la semilla en el ruido de la ocultación. Heredado de la
-/// implementación original; libopus usa `seed>>20` y **no se ha comprobado** si importa.
-const PLC_NOISE_SHIFT: u32 = 16;
 /// Probabilidades de los indicadores TF (`tf_decode`): la primera banda usa 1/2^2 en transitorio y
 /// 1/2^4 si no; las siguientes, 1/2^4 y 1/2^5.
 const TF_FIRST_LOGP_TRANSIENT: i32 = 2;
@@ -142,7 +141,26 @@ pub(crate) struct CeltDecoder {
     final_range: u32,
     rng_seed: u32,
     last_split_count: usize,
-    loss_count: u32,
+    /// Bloques cortos perdidos desde la última trama buena (`loss_duration`).
+    loss_duration: u32,
+    /// Banda siguiente a la última de la última trama buena, con la que se oculta la siguiente
+    /// pérdida (`st->end`).
+    end_band: usize,
+    /// Bloques cortos ocultados seguidos (`plc_duration`); desde 40 se oculta con ruido.
+    plc_duration: u32,
+    /// Ocultar con ruido aunque se pudiera repetir el tono: hasta que lleguen dos tramas buenas
+    /// seguidas tras un reinicio o una ocultación por ruido (`skip_plc`).
+    skip_plc: bool,
+    /// Si la última trama se ocultó repitiendo el tono; la siguiente pérdida reutiliza su periodo
+    /// y su predicción (`last_frame_type == FRAME_PLC_PERIODIC`).
+    last_frame_periodic: bool,
+    /// Periodo de tono de la última ocultación periódica (`last_pitch_index`).
+    last_pitch_index: usize,
+    /// La trama siguiente ha de fundir el solapamiento de la ocultación periódica, que no pasó
+    /// por el postfiltro (`prefilter_and_fold`).
+    prefilter_and_fold: bool,
+    /// Predicción lineal de cada canal de la ocultación periódica.
+    lpc: [[f32; plc::LPC_ORDER]; 2],
 }
 
 impl CeltDecoder {
@@ -174,7 +192,14 @@ impl CeltDecoder {
             final_range: 0,
             rng_seed: 0,
             last_split_count: 0,
-            loss_count: 0,
+            loss_duration: 0,
+            end_band: mode.nb_ebands,
+            plc_duration: 0,
+            skip_plc: true,
+            last_frame_periodic: false,
+            last_pitch_index: 0,
+            prefilter_and_fold: false,
+            lpc: [[0.0; plc::LPC_ORDER]; 2],
         }
     }
 
@@ -193,7 +218,13 @@ impl CeltDecoder {
         self.rng_seed = 0;
         self.last_split_count = 0;
         self.start_band = 0;
-        self.loss_count = 0;
+        self.loss_duration = 0;
+        self.plc_duration = 0;
+        self.skip_plc = true;
+        self.last_frame_periodic = false;
+        self.last_pitch_index = 0;
+        self.prefilter_and_fold = false;
+        self.lpc = [[0.0; plc::LPC_ORDER]; 2];
     }
 
     /// Anula el postfiltro de tono: periodo, ganancia y juego de coeficientes, actuales y
@@ -225,11 +256,6 @@ impl CeltDecoder {
         } else {
             &self.decode_mem_right
         }
-    }
-
-    /// Olvida las pérdidas seguidas antes de decodificar un paquete bueno.
-    pub fn reset_loss_count(&mut self) {
-        self.loss_count = 0;
     }
 
     /// Factor de diezmado de 48 kHz a la frecuencia de salida.
@@ -285,137 +311,195 @@ impl CeltDecoder {
         Ok(())
     }
 
-    /// Banda siguiente a la más alta con energía guardada por encima del suelo en alguno de los
-    /// `channels` canales; la ocultación da forma al ruido hasta ella.
-    fn plc_end_band(&self, channels: usize) -> usize {
-        let active_channels = channels.clamp(1, 2);
-        let nb_ebands = self.mode.nb_ebands;
-        for band in (0..nb_ebands).rev() {
-            for ch in 0..active_channels {
-                if self.prev_energy[ch * nb_ebands + band] > LOG_ENERGY_FLOOR_DB {
-                    return band + 1;
-                }
-            }
+    /// Oculta una trama CELT perdida de `frame_size` muestras por canal y escribe su salida en
+    /// `out` según `output`, como `celt_decode_lost` de libopus con `FRAME_PLC_NOISE`: ruido con
+    /// la energía de la última trama, que cae sin bajar de la de fondo, en las bandas desde la
+    /// inicial, y el postfiltro con los últimos parámetros. libopus repite en su lugar el periodo
+    /// de tono de la señal anterior (`FRAME_PLC_PERIODIC`) cuando la trama empieza en la banda 0
+    /// y las pérdidas son recientes; aquí aún no (defecto conocido).
+    ///
+    /// # Errores
+    ///
+    /// `NotImplemented` si la duración no es de CELT o la frecuencia de salida no está admitida,
+    /// y `OutputTooSmall` si la trama no cabe en `out`.
+    pub fn decode_lost(
+        &mut self,
+        frame_size: usize,
+        out: &mut [i16],
+        output: CeltOutput,
+    ) -> Result<usize, Error> {
+        let downsample = self.downsample_factor()?;
+        let frame_size_48k = frame_size
+            .checked_mul(downsample)
+            .ok_or(Error::NotImplemented)?;
+        let lm = lm_for_frame_size(frame_size_48k).ok_or(Error::NotImplemented)?;
+        let channels = self.channels as usize;
+        let needed = frame_size * channels;
+        if out.len() < needed {
+            return Err(Error::OutputTooSmall {
+                needed,
+                got: out.len(),
+            });
         }
-        0
+
+        let periodic = self.start_band == 0
+            && !self.skip_plc
+            && self.plc_duration < plc::MAX_PERIODIC_PLC_DURATION;
+        if periodic {
+            self.conceal_periodic(frame_size_48k);
+        } else {
+            self.conceal_with_noise(frame_size_48k, lm, downsample)?;
+        }
+        let out_start = Self::out_start(frame_size_48k);
+        for ch in 0..channels {
+            let mut ch_synth = self.channel_mem(ch)[out_start..out_start + frame_size_48k].to_vec();
+            self.apply_deemph(ch, &mut ch_synth);
+            self.write_output_channel_i16(out, &ch_synth, ch, output)?;
+        }
+
+        self.final_range = 0;
+        self.last_split_count = 0;
+        self.loss_duration = (self.loss_duration + (1 << lm)).min(plc::LOSS_DURATION_MAX);
+        self.plc_duration = (self.plc_duration + (1 << lm)).min(plc::LOSS_DURATION_MAX);
+        self.last_frame_periodic = periodic;
+        Ok(frame_size)
     }
 
-    /// Oculta una trama CELT perdida de `frame_size` muestras por canal y devuelve su PCM en
-    /// coma flotante, con `channels` canales entrelazados.
-    pub fn decode_lost(&mut self, frame_size: usize, channels: usize) -> Vec<f32> {
-        let downsample = match self.downsample_factor() {
-            Ok(value) => value,
-            Err(_) => return Vec::new(),
-        };
-        let active_channels = channels.clamp(1, self.channels as usize).min(2);
-        let mut pcm = vec![0.0f32; frame_size * active_channels];
-        let Some(frame_size_48k) = frame_size.checked_mul(downsample) else {
-            return pcm;
-        };
-        let Some(lm) = lm_for_frame_size(frame_size_48k) else {
-            return pcm;
-        };
-
-        let end = self.plc_end_band(active_channels);
-        if end == 0 {
-            self.loss_count = self.loss_count.saturating_add(1);
-            return pcm;
+    /// Oculta la trama con ruido (`FRAME_PLC_NOISE`): la energía de la última trama cae sin bajar
+    /// de la de fondo, el ruido llena las bandas desde la inicial y se filtra con los últimos
+    /// parámetros del postfiltro. Después de una ocultación por ruido no se repite el tono hasta
+    /// que lleguen dos tramas buenas seguidas.
+    ///
+    /// # Errores
+    ///
+    /// Los de la MDCT inversa.
+    fn conceal_with_noise(
+        &mut self,
+        frame_size_48k: usize,
+        lm: usize,
+        downsample: usize,
+    ) -> Result<(), Error> {
+        let channels = self.channels as usize;
+        if self.prefilter_and_fold {
+            self.prefilter_and_fold();
         }
-
-        let energies: Vec<Vec<f32>> = (0..active_channels)
-            .map(|ch| self.plc_band_energy(ch, end))
-            .collect();
+        let nb_ebands = self.mode.nb_ebands;
+        let start = self.start_band;
+        let end = self.end_band;
+        // `effEnd`: en el modo de 48 kHz todas las bandas son efectivas (`effEBands` = 21).
+        let eff_end = start.max(end.min(nb_ebands));
+        let decay = plc::noise_decay(self.loss_duration);
         let shape = SynthesisShape {
             frame_size_48k,
             lm,
             is_transient: false,
         };
-        for (ch, energy) in energies.iter().enumerate() {
-            if self.conceal_channel(ch, energy, end, shape).is_err() {
-                return pcm;
-            }
+        for ch in 0..channels {
+            let energy = ch * nb_ebands..(ch + 1) * nb_ebands;
+            plc::decay_energy(
+                &mut self.prev_energy[energy.clone()],
+                &self.background_log_energy[energy],
+                start..end,
+                decay,
+            );
         }
-        self.reset_postfilter();
-        self.store_concealed_energy(&energies);
-
-        let out_start = Self::out_start(frame_size_48k);
-        for ch in 0..active_channels {
-            let mut synth = self.channel_mem(ch)[out_start..out_start + frame_size_48k].to_vec();
-            self.apply_deemph(ch, &mut synth);
-            for i in 0..frame_size {
-                pcm[i * active_channels + ch] = synth[i * downsample];
-            }
+        for ch in 0..channels {
+            let mut spectrum = vec![0.0f32; frame_size_48k];
+            self.rng_seed = plc::fill_noise(
+                &mut spectrum,
+                self.mode.e_bands,
+                start..eff_end,
+                lm,
+                self.rng_seed,
+            );
+            let mut denorm = vec![0.0f32; frame_size_48k];
+            bands::denormalise_bands(
+                self.mode,
+                &spectrum,
+                &mut denorm,
+                &self.prev_energy[ch * nb_ebands..(ch + 1) * nb_ebands],
+                start..eff_end,
+                lm,
+                downsample,
+            );
+            let mem = if ch == 0 {
+                &mut self.decode_mem
+            } else {
+                &mut self.decode_mem_right
+            };
+            self.mdct_bank.synthesise_into(&denorm, shape, mem)?;
         }
 
-        self.final_range = 0;
-        self.last_split_count = 0;
-        self.loss_count = self.loss_count.saturating_add(1);
-        pcm
+        let current = self.current_postfilter_taps();
+        self.run_postfilter(lm, frame_size_48k, Self::out_start(frame_size_48k), current);
+        self.prefilter_and_fold = false;
+        self.skip_plc = true;
+        Ok(())
     }
 
-    /// Energía por banda con la que se oculta una trama perdida del canal `ch`: la de la última
-    /// trama; tras la primera pérdida, atenuada sin bajar de la energía de fondo. Las bandas desde
-    /// `end` quedan en el suelo.
-    fn plc_band_energy(&self, ch: usize, end: usize) -> Vec<f32> {
-        let nb_ebands = self.mode.nb_ebands;
-        let offset = ch * nb_ebands;
-        let mut energy = self.prev_energy[offset..offset + nb_ebands].to_vec();
-        if self.loss_count > 0 {
-            let background = &self.background_log_energy[offset..offset + end];
-            for (e, &floor) in energy[..end].iter_mut().zip(background) {
-                *e = (*e - PLC_NOISE_ENERGY_DECAY).max(floor);
-            }
-        }
-        energy[end..].fill(LOG_ENERGY_FLOOR_DB);
-        energy
-    }
-
-    /// Ruido pseudoaleatorio de norma unidad en cada banda por debajo de `end`.
-    fn plc_noise_spectrum(&mut self, end: usize, shape: SynthesisShape) -> Vec<f32> {
-        let lm = shape.lm;
-        let mut spectrum = vec![0.0f32; shape.frame_size_48k];
-        for band in 0..end {
-            let start = (self.mode.e_bands[band] as usize) << lm;
-            let band_len =
-                (self.mode.e_bands[band + 1] as usize - self.mode.e_bands[band] as usize) << lm;
-            for value in &mut spectrum[start..start + band_len] {
-                self.rng_seed = bands::celt_lcg_rand(self.rng_seed);
-                *value = ((self.rng_seed >> PLC_NOISE_SHIFT) as i16) as f32;
-            }
-            vq::renormalise_vector(&mut spectrum[start..start + band_len], 1.0);
-        }
-        spectrum
-    }
-
-    /// Sintetiza en la memoria del canal `ch` una trama de ruido con la energía `energy`.
-    fn conceal_channel(
-        &mut self,
-        ch: usize,
-        energy: &[f32],
-        end: usize,
-        shape: SynthesisShape,
-    ) -> Result<(), Error> {
-        let spectrum = self.plc_noise_spectrum(end, shape);
-        let mut denorm = vec![0.0f32; shape.frame_size_48k];
-        bands::denormalise_bands(self.mode, &spectrum, &mut denorm, energy, 0..end, shape.lm);
-        let mem = if ch == 0 {
-            &mut self.decode_mem
+    /// Oculta la trama repitiendo el periodo de tono de la señal anterior en cada canal
+    /// (`FRAME_PLC_PERIODIC`). La primera pérdida busca el periodo y calcula la predicción; las
+    /// siguientes los reutilizan con una atenuación adicional. La trama siguiente funde el
+    /// solapamiento.
+    fn conceal_periodic(&mut self, frame_size_48k: usize) {
+        let first = !self.last_frame_periodic;
+        let (pitch, fade) = if first {
+            let channels: Vec<&[f32]> = (0..self.channels as usize)
+                .map(|ch| self.channel_mem(ch))
+                .collect();
+            let pitch = pitch::plc_pitch_search(&channels, DECODE_BUFFER_SIZE >> 1);
+            self.last_pitch_index = pitch;
+            (pitch, 1.0)
         } else {
-            &mut self.decode_mem_right
+            (self.last_pitch_index, plc::REPEATED_LOSS_FADE)
         };
-        self.mdct_bank.synthesise_into(&denorm, shape, mem)
+        let params = plc::PeriodicConcealment {
+            window: self.mode.window,
+            pitch,
+            fade,
+            frame_size_48k,
+            recompute_lpc: first,
+        };
+        let [lpc_left, lpc_right] = &mut self.lpc;
+        plc::conceal_periodic(&mut self.decode_mem, lpc_left, &params);
+        if self.channels == 2 {
+            plc::conceal_periodic(&mut self.decode_mem_right, lpc_right, &params);
+        }
+        self.prefilter_and_fold = true;
     }
 
-    /// Guarda la energía de la trama oculta como la de la última trama. Con un solo canal activo
-    /// ambas mitades del estado reciben la del izquierdo.
-    fn store_concealed_energy(&mut self, energies: &[Vec<f32>]) {
-        let nb_ebands = self.mode.nb_ebands;
-        for ch in 0..2 {
-            let energy = &energies[ch.min(energies.len() - 1)];
-            let half = ch * nb_ebands..(ch + 1) * nb_ebands;
-            self.old_log_energy2[half.clone()].copy_from_slice(&self.old_log_energy[half.clone()]);
-            self.old_log_energy[half.clone()].copy_from_slice(energy);
-            self.prev_energy[half].copy_from_slice(energy);
+    /// Funde con la trama que se va a sintetizar el solapamiento de una ocultación periódica, que
+    /// no pasó por el postfiltro (`prefilter_and_fold`): le aplica el prefiltro (el postfiltro con
+    /// las ganancias cambiadas de signo) y simula la cancelación del solapamiento de la MDCT.
+    /// libopus lo hace tras desplazar la memoria una trama, en `DECODE_BUFFER_SIZE - N`; aquí, antes
+    /// del desplazamiento, en `DECODE_BUFFER_SIZE`, que es la misma muestra.
+    fn prefilter_and_fold(&mut self) {
+        let overlap = self.mode.overlap;
+        let window = self.mode.window;
+        let gain = -self.postfilter_gain;
+        let period = self.postfilter_period.max(COMBFILTER_MINPERIOD as i32) as usize;
+        let taps = COMB_FILTER_GAINS[self.postfilter_tapset.min(2)];
+        let channels = self.channels as usize;
+        for mem in [&mut self.decode_mem, &mut self.decode_mem_right]
+            .into_iter()
+            .take(channels)
+        {
+            // Con la ganancia nueva a cero, `comb_filter` copia la entrada.
+            let etmp = if gain == 0.0 {
+                mem[DECODE_BUFFER_SIZE..DECODE_BUFFER_SIZE + overlap].to_vec()
+            } else {
+                x86_kernels::comb_filter_const_sse(
+                    mem,
+                    DECODE_BUFFER_SIZE,
+                    period,
+                    overlap,
+                    [gain * taps[0], gain * taps[1], gain * taps[2]],
+                )
+            };
+            for i in 0..overlap / 2 {
+                mem[DECODE_BUFFER_SIZE + i] =
+                    window[i] * etmp[overlap - 1 - i] + window[overlap - 1 - i] * etmp[i];
+            }
         }
     }
 
@@ -537,10 +621,17 @@ impl CeltDecoder {
         if g1 == 0.0 {
             return;
         }
+        // Fuera del solapamiento, libopus x86 filtra con `comb_filter_const_sse`, que suma en
+        // otro orden que su versión en C.
         for i in overlap_len..n {
             let x0 = buf[start + i - period1 + 2];
-            let y = buf[start + i] + g10 * x2 + g11 * (x1 + x3) + g12 * (x0 + x4);
-            buf[start + i] = y;
+            buf[start + i] = x86_kernels::comb_filter_const_sample(
+                buf[start + i],
+                x2,
+                x3 + x1,
+                x4 + x0,
+                [g10, g11, g12],
+            );
             x4 = x3;
             x3 = x2;
             x2 = x1;
@@ -608,6 +699,10 @@ impl CeltDecoder {
             });
         }
 
+        // La ocultación periódica solo vuelve tras dos tramas buenas seguidas.
+        if self.loss_duration == 0 {
+            self.skip_plc = false;
+        }
         let coded_channels = packet_channels.clamp(1, 2) as usize;
         if coded_channels == 1 {
             let nb = self.mode.nb_ebands;
@@ -627,6 +722,7 @@ impl CeltDecoder {
             lm,
             coded_channels,
             frame_size_48k,
+            downsample: self.downsample_factor()?,
             total_bits,
         };
         let header = decode_frame_header(ec, &layout);
@@ -635,6 +731,9 @@ impl CeltDecoder {
         let shapes = self.finalise_energy(ec, &layout, &header, &allocation, shapes);
         let (denorm, denorm_right_for_stereo) =
             self.denormalise_channels(&layout, &header, &shapes);
+        if self.prefilter_and_fold {
+            self.prefilter_and_fold();
+        }
         let out_start = self.synthesise(&layout, &header, denorm, denorm_right_for_stereo)?;
         self.apply_postfilter(&layout, &header, out_start);
         self.update_energy_history(&layout, &header);
@@ -646,6 +745,11 @@ impl CeltDecoder {
 
         self.final_range = ec.final_range();
         self.rng_seed = ec.rng();
+        self.loss_duration = 0;
+        self.plc_duration = 0;
+        self.last_frame_periodic = false;
+        self.prefilter_and_fold = false;
+        self.end_band = end;
         Ok(CeltFrameDecode {
             samples_per_channel: output_samples,
         })
@@ -669,6 +773,9 @@ impl CeltDecoder {
         } = *layout;
         let intra_ener = header.intra_ener;
         let is_transient = header.is_transient;
+        if !intra_ener && self.loss_duration != 0 {
+            self.make_energy_prediction_safe(start..end, lm);
+        }
         quant_bands::unquant_coarse_energy(
             &self.energy_frame(layout),
             &mut self.prev_energy,
@@ -725,6 +832,25 @@ impl CeltDecoder {
             spread_decision,
             alloc,
             anti_collapse_rsv,
+        }
+    }
+
+    /// Tras una pérdida, hace segura la predicción de energía de las bandas `bands` de los dos
+    /// canales del estado antes de leer la energía gruesa, como `celt_decode_with_ec` de libopus.
+    fn make_energy_prediction_safe(&mut self, bands: Range<usize>, lm: usize) {
+        let nb_ebands = self.mode.nb_ebands;
+        for ch in 0..2 {
+            let channel = ch * nb_ebands..(ch + 1) * nb_ebands;
+            plc::make_energy_prediction_safe(
+                plc::EnergyHistory {
+                    last: &mut self.prev_energy[channel.clone()],
+                    previous: &self.old_log_energy[channel.clone()],
+                    before_previous: &self.old_log_energy2[channel],
+                },
+                bands.clone(),
+                lm,
+                self.loss_duration,
+            );
         }
     }
 
@@ -789,6 +915,7 @@ impl CeltDecoder {
             coded_channels,
             frame_size_48k,
             total_bits,
+            ..
         } = *layout;
         let is_transient = header.is_transient;
         let tf_res = &allocation.tf_res;
@@ -922,6 +1049,7 @@ impl CeltDecoder {
             lm,
             coded_channels,
             frame_size_48k,
+            downsample,
             ..
         } = *layout;
         let silence_flag = header.silence;
@@ -934,6 +1062,7 @@ impl CeltDecoder {
                 &self.prev_energy[..self.mode.nb_ebands],
                 start..end,
                 lm,
+                downsample,
             );
         }
         let mut denorm_right_for_stereo: Option<Vec<f32>> = None;
@@ -948,6 +1077,7 @@ impl CeltDecoder {
                         &self.prev_energy[self.mode.nb_ebands..self.mode.nb_ebands * 2],
                         start..end,
                         lm,
+                        downsample,
                     );
                 }
                 if self.channels == 1 {
@@ -994,15 +1124,35 @@ impl CeltDecoder {
     /// Aplica el filtro peine (postfiltro de tono) a cada canal y guarda sus parámetros para la
     /// trama siguiente.
     fn apply_postfilter(&mut self, layout: &FrameLayout, header: &FrameHeader, out_start: usize) {
-        let FrameLayout {
-            lm, frame_size_48k, ..
-        } = *layout;
-        let postfilter_pitch = header.postfilter.pitch;
-        let postfilter_tapset = header.postfilter.tapset;
-        let postfilter_gain = header.postfilter.gain;
+        let new = PitchTaps {
+            period: header.postfilter.pitch.max(0) as usize,
+            gain: header.postfilter.gain,
+            tapset: header.postfilter.tapset.clamp(0, 2) as usize,
+        };
+        self.run_postfilter(layout.lm, layout.frame_size_48k, out_start, new);
+    }
+
+    /// Parámetros del postfiltro de la última trama, con los que se filtra la trama oculta.
+    fn current_postfilter_taps(&self) -> PitchTaps {
+        PitchTaps {
+            period: self.postfilter_period.max(0) as usize,
+            gain: self.postfilter_gain,
+            tapset: self.postfilter_tapset,
+        }
+    }
+
+    /// Aplica el postfiltro a la trama de `frame_size_48k` muestras que empieza en `out_start`:
+    /// en el primer bloque corto pasa de los parámetros anteriores a los actuales y, en el resto,
+    /// de los actuales a `new`, que pasan a ser los actuales.
+    fn run_postfilter(
+        &mut self,
+        lm: usize,
+        frame_size_48k: usize,
+        out_start: usize,
+        new: PitchTaps,
+    ) {
         let pf_period = self.postfilter_period.max(COMBFILTER_MINPERIOD as i32) as usize;
         let pf_period_old = self.postfilter_period_old.max(COMBFILTER_MINPERIOD as i32) as usize;
-        let decoded_tapset = postfilter_tapset.clamp(0, 2) as usize;
         let pass = CombFilterPass {
             out_start,
             frame_size_48k,
@@ -1018,11 +1168,7 @@ impl CeltDecoder {
                 gain: self.postfilter_gain,
                 tapset: self.postfilter_tapset,
             },
-            new: PitchTaps {
-                period: postfilter_pitch.max(0) as usize,
-                gain: postfilter_gain,
-                tapset: decoded_tapset,
-            },
+            new,
             window: self.mode.window,
             overlap: self.mode.overlap,
         };
@@ -1036,9 +1182,9 @@ impl CeltDecoder {
         self.postfilter_period_old = self.postfilter_period;
         self.postfilter_gain_old = self.postfilter_gain;
         self.postfilter_tapset_old = self.postfilter_tapset;
-        self.postfilter_period = postfilter_pitch;
-        self.postfilter_gain = postfilter_gain;
-        self.postfilter_tapset = decoded_tapset;
+        self.postfilter_period = new.period as i32;
+        self.postfilter_gain = new.gain;
+        self.postfilter_tapset = new.tapset;
         if lm != 0 {
             self.postfilter_period_old = self.postfilter_period;
             self.postfilter_gain_old = self.postfilter_gain;
@@ -1071,9 +1217,11 @@ impl CeltDecoder {
                 self.old_log_energy[i] = self.old_log_energy[i].min(self.prev_energy[i]);
             }
         }
-        let m = 1usize << lm;
+        // Tras una pérdida, el fondo puede subir lo que habría subido en todos los bloques
+        // perdidos, no solo en los de esta trama.
+        let blocks = self.loss_duration as usize + (1usize << lm);
         let max_background_increase =
-            (m.min(BACKGROUND_MAX_INCREASE_BLOCKS) as f32) * BACKGROUND_INCREASE_PER_BLOCK;
+            (blocks.min(BACKGROUND_MAX_INCREASE_BLOCKS) as f32) * BACKGROUND_INCREASE_PER_BLOCK;
         for i in 0..state_len {
             self.background_log_energy[i] =
                 (self.background_log_energy[i] + max_background_increase).min(self.prev_energy[i]);
@@ -1155,6 +1303,8 @@ struct FrameLayout {
     coded_channels: usize,
     /// Duración de la trama en muestras a 48 kHz.
     frame_size_48k: usize,
+    /// Factor de diezmado de 48 kHz a la frecuencia de salida.
+    downsample: usize,
     /// Bits disponibles en la trama.
     total_bits: i32,
 }
@@ -1255,11 +1405,6 @@ fn lm_for_frame_size(frame_size_48k: usize) -> Option<usize> {
         .position(|&samples| samples == frame_size_48k)
 }
 
-/// Tamaño de la MDCT inversa de una trama con el LM dado.
-fn mdct_size(lm: usize) -> usize {
-    MDCT_SIZE_PER_FRAME_SAMPLE * CELT_FRAME_SAMPLES_48K[lm]
-}
-
 /// Decodifica los indicadores tiempo-frecuencia de las bandas `start..end` en `tf_res`
 /// (`tf_decode`): uno por banda mientras quede presupuesto en `total_bits`, el selector si
 /// cambia algo, y la traducción con `tf_select_table`.
@@ -1308,5 +1453,44 @@ fn tf_decode(
     for t in tf_res.iter_mut().take(end).skip(start) {
         let idx = row + 2 * tf_select as usize + *t as usize;
         *t = TF_SELECT_TABLE[lm][idx] as i32;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{CeltDecoder, CeltOutput, NBANDS_48K_20MS};
+
+    /// Frecuencia de salida diezmada: 48 kHz entre 3, Nyquist a 8 kHz.
+    const FS_16K_HZ: u32 = 16_000;
+    /// Trama de 20 ms a 16 kHz.
+    const FRAME_20MS_16K: usize = 320;
+    /// Primera banda que empieza por encima de 8 kHz (`eBands[17]` = 40, 40 × 200 Hz).
+    const FIRST_BAND_ABOVE_8K: usize = 17;
+    /// Energías (log2) de la última trama, por encima del suelo para que se oculten todas.
+    const LOW_ENERGY: f32 = 2.0;
+    const HIGH_ENERGY: f32 = 8.0;
+
+    /// Ocultación a 16 kHz con la energía `high` en las bandas por encima de 8 kHz.
+    fn conceal_with_high_bands(high: f32) -> Vec<i16> {
+        let mut dec = CeltDecoder::new(FS_16K_HZ, 1);
+        let mut energy = vec![LOW_ENERGY; NBANDS_48K_20MS];
+        energy[FIRST_BAND_ABOVE_8K..].fill(high);
+        dec.prev_energy[..NBANDS_48K_20MS].copy_from_slice(&energy);
+        let mut out = vec![0i16; FRAME_20MS_16K];
+        dec.decode_lost(FRAME_20MS_16K, &mut out, CeltOutput::Replace)
+            .unwrap();
+        out
+    }
+
+    /// Como `celt_decode_lost` de libopus (`celt_synthesis` con `downsample`): a 16 kHz el ruido
+    /// de las bandas por encima de 8 kHz se anula antes de diezmar, así que su energía no cambia
+    /// la salida. Sin el recorte se replegaría por debajo de 8 kHz.
+    #[test]
+    fn concealment_ignores_bands_above_output_nyquist() {
+        let low = conceal_with_high_bands(LOW_ENERGY);
+        let high = conceal_with_high_bands(HIGH_ENERGY);
+
+        assert!(low.iter().any(|&s| s != 0));
+        assert_eq!(low, high);
     }
 }

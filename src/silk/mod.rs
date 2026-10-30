@@ -8,9 +8,10 @@ use crate::entropy::EcDec;
 use crate::packet::{DURATIONS_PER_BANDWIDTH, OPUS_RATE_HZ, SILK_FRAME_SAMPLES_48K};
 use tables::{
     FS_KHZ_MB, FS_KHZ_NB, FS_KHZ_WB, HZ_PER_KHZ, ICDF_FTB, MAX_NB_SUBFR, NB_SUBFR_10MS,
-    NLSF_INTERP_NONE_Q2, ONE_Q16, SUB_FRAME_LENGTH_MS, TYPE_VOICED,
+    NLSF_INTERP_NONE_Q2, SUB_FRAME_LENGTH_MS,
 };
 
+mod cng;
 mod decode_core;
 mod entropy_tables;
 mod fixed;
@@ -29,6 +30,9 @@ mod tables;
 
 const MAX_INTERNAL_FRAMES: usize = 3;
 const MAX_LPC_HALVES: usize = 2;
+/// Expansión de ancho de banda de los LPC de la primera trama buena tras una pérdida: 0,97 en
+/// Q16 (`BWE_AFTER_LOSS_Q16`, `silk/define.h`).
+const BWE_AFTER_LOSS_Q16: i32 = 63_570;
 /// Frecuencia interna de SILK para cada ancho de banda de la configuración del TOC: estrecha,
 /// media, ancha y, en las híbridas superanchas, también ancha (RFC 6716 §3.1, Tabla 2).
 const SILK_INTERNAL_FS_KHZ_BY_BANDWIDTH: [u32; 4] = [FS_KHZ_NB, FS_KHZ_MB, FS_KHZ_WB, FS_KHZ_WB];
@@ -46,6 +50,16 @@ pub(crate) struct SilkFrameRequest {
     pub config: u8,
     /// Canales codificados en el paquete (1 o 2).
     pub packet_channels: u8,
+}
+
+/// Qué se decodifica de una trama SILK.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SilkPayload {
+    /// La carga principal; las tramas LBRR que lleve se leen y se descartan.
+    Main,
+    /// Las tramas LBRR (FEC en banda), para recuperar el paquete anterior perdido. Las tramas
+    /// internas sin LBRR se ocultan.
+    Lbrr,
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -66,12 +80,13 @@ struct FrameLayout {
     frame_length: usize,
 }
 
-/// Una trama interna de un canal: su posición en el paquete, su bit de actividad de voz, su
-/// codificación condicional y su longitud.
+/// Una trama interna de un canal: su posición en el paquete, su bit de actividad de voz, si es
+/// una trama LBRR, su codificación condicional y su longitud.
 #[derive(Debug, Clone, Copy)]
 struct InternalFrame {
     index: usize,
     vad: bool,
+    lbrr: bool,
     cond: indices::CondCoding,
     frame_length: usize,
 }
@@ -81,6 +96,9 @@ struct InternalPcm<'a> {
     channels: [&'a [i16]; 2],
     packet_channels: usize,
     frame_length: usize,
+    /// Paquete mono tras uno estéreo a la misma frecuencia interna (ver
+    /// [`SilkDecoder::collapses_stereo`]).
+    collapses_stereo: bool,
 }
 
 /// Estado persistente de un canal codificado de SILK: índices, síntesis, remuestreo y
@@ -91,7 +109,7 @@ struct SilkChannel {
     indices: indices::ChannelState,
     /// Estado de la síntesis y de la ocultación de pérdidas.
     core: decode_core::SilkChannelState,
-    /// Remuestreador a la frecuencia de la API; se crea con la primera trama a 48 kHz.
+    /// Remuestreador a la frecuencia de la API; se crea con la primera trama del canal.
     resampler: Option<resampler::SilkResampler>,
     /// NLSF de la trama interna anterior, para interpolar (`prevNLSF_Q15`).
     prev_nlsf_q15: [i16; tables::MAX_LPC_ORDER],
@@ -116,21 +134,28 @@ impl Default for SilkChannel {
 
 impl SilkChannel {
     /// Fija la frecuencia interna `fs_khz` y las subtramas de la trama. Si la frecuencia cambia,
-    /// se reinicia la síntesis y la siguiente trama no interpola las NLSF.
+    /// se reinicia solo la historia de la síntesis, como `silk_decoder_set_fs` de libopus: la
+    /// ganancia anterior y la excitación se conservan, y la ocultación y el ruido de confort se
+    /// reinician solos al ver la frecuencia nueva.
     fn set_internal_rate(&mut self, fs_khz: u32, nb_subfr: usize) {
         let prev_fs_khz = self.indices.fs_khz;
         if prev_fs_khz != 0 && prev_fs_khz != fs_khz {
-            self.core = decode_core::SilkChannelState::default();
-            self.first_frame_after_reset = true;
+            self.reset_synthesis_history();
         }
         indices::configure_channel_state(&mut self.indices, fs_khz, nb_subfr);
     }
 
-    /// Reinicia el canal lateral al volver a codificarse tras una trama solo de medio
-    /// (`silk_Decode` de libopus): su síntesis empieza de cero y la siguiente trama no
-    /// interpola las NLSF.
-    fn reset_side_after_mid_only(&mut self) {
-        self.core.reset_side_after_mid_only();
+    /// Devuelve el canal a su estado inicial, como `silk_init_decoder` de libopus.
+    fn restart(&mut self) {
+        *self = Self::default();
+    }
+
+    /// Reinicia la historia de la síntesis del canal (ver
+    /// [`decode_core::SilkChannelState::reset_synthesis_history`]) y hace que la siguiente trama
+    /// no interpole las NLSF. Es lo que hace `silk_Decode` de libopus con el canal lateral al
+    /// volver a codificarse tras una trama solo de medio.
+    fn reset_synthesis_history(&mut self) {
+        self.core.reset_synthesis_history();
         self.first_frame_after_reset = true;
     }
 
@@ -151,9 +176,10 @@ impl SilkChannel {
         Ok(())
     }
 
-    /// Decodifica la trama interna `frame` de este canal en `pcm`: índices, coeficientes LPC,
-    /// pulsos y síntesis. Devuelve lo que necesita la ocultación cuando la trama ya esté en
-    /// izquierdo y derecho.
+    /// Decodifica la trama interna `frame` de este canal en `pcm` como `silk_decode_frame` de
+    /// libopus: índices, coeficientes LPC (expandidos si es la primera tras una pérdida), pulsos y
+    /// síntesis; después, la actualización de la ocultación, el ruido de confort y el fundido con
+    /// la ocultación anterior.
     ///
     /// # Errores
     ///
@@ -163,9 +189,11 @@ impl SilkChannel {
         dec: &mut EcDec<'_>,
         frame: InternalFrame,
         pcm: &mut [i16],
-    ) -> Result<PlcUpdate, Error> {
-        let side = indices::decode_indices(&mut self.indices, dec, frame.vad, false, frame.cond)?;
+    ) -> Result<(), Error> {
+        let side =
+            indices::decode_indices(&mut self.indices, dec, frame.vad, frame.lbrr, frame.cond)?;
         let fs_khz = self.indices.fs_khz;
+        let after_loss = self.core.plc.loss_cnt() > 0;
         let pred_coef_q12 = &mut self.pred_coef_q12[frame.index];
         update_lpc_from_nlsf(
             fs_khz,
@@ -174,6 +202,12 @@ impl SilkChannel {
             pred_coef_q12,
             &mut self.first_frame_after_reset,
         );
+        let lpc_order = tables::nlsf_codebook(fs_khz).order;
+        if after_loss {
+            for half in pred_coef_q12.iter_mut() {
+                lpc::bwexpander(half, lpc_order, BWE_AFTER_LOSS_Q16);
+            }
+        }
         let pulses = indices::decode_pulses(
             dec,
             side.signal_type,
@@ -195,103 +229,68 @@ impl SilkChannel {
             frame_length: frame.frame_length,
             nb_subfr: self.indices.nb_subfr,
             fs_khz,
-            lpc_order: tables::nlsf_codebook(fs_khz).order,
+            lpc_order,
         };
-        decode_core::decode_core(&params, pred_coef_q12, pcm, &mut self.core);
-        Ok(PlcUpdate::new(&params, &pred_coef_q12[1]))
-    }
-
-    /// Actualiza el estado de ocultación con la trama interna `pcm` ya decodificada.
-    fn update_plc(&mut self, update: &PlcUpdate, pcm: &[i16]) {
-        let decoded = plc::SilkDecodedFrame {
-            lag: update.lag,
-            ltp_gains: update.ltp_gains,
-            output: pcm.to_vec(),
-        };
-        let nb_subfr = self.indices.nb_subfr;
-        plc::plc_update(
-            &mut self.core.plc,
-            &decoded,
-            &update.lpc_q12[..update.lpc_order],
+        let control = decode_core::decode_core(&params, pred_coef_q12, pcm, &mut self.core);
+        let nb_subfr = params.nb_subfr;
+        let subfr_length = frame.frame_length / nb_subfr;
+        self.core.plc.update(&plc::DecodedFrame {
+            signal_type: params.signal_type,
+            control: &control,
+            pred_coef_q12: &self.pred_coef_q12[frame.index][1][..lpc_order],
             nb_subfr,
-            pcm.len() / nb_subfr,
-            self.indices.fs_khz as i32,
-            update.lpc_order,
-        );
+            subfr_length,
+            fs_khz,
+        });
+        self.comfort_noise_and_glue(&control.gains_q16[..nb_subfr], pcm);
+        self.core.lag_prev = control.pitch_l[nb_subfr - 1];
+        Ok(())
     }
 
-    /// Oculta una trama interna perdida en `frame` y la añade al historial de síntesis.
-    fn conceal(&mut self, frame: &mut [i16], loss_count: u32) {
+    /// Oculta una trama interna perdida en `pcm` como `silk_decode_frame` de libopus con
+    /// pérdida: la ocultación, la salida reciente, el ruido de confort y la energía para el
+    /// fundido. La trama dura lo que la última decodificada.
+    fn conceal(&mut self, pcm: &mut [i16]) {
+        let fs_khz = self.indices.fs_khz;
         let core = &mut self.core;
-        plc::plc_conceal(
-            &mut core.plc,
-            &mut core.s_lpc_q14_buf[..],
-            frame,
-            loss_count,
-        );
-        core.record_concealed_frame(frame);
-    }
-}
-
-/// Lo que la ocultación necesita de una trama interna decodificada: el lag de tono y las
-/// ganancias LTP (cero en tramas no sonoras) y los coeficientes LPC de su segunda mitad.
-struct PlcUpdate {
-    lag: i32,
-    ltp_gains: [i32; MAX_NB_SUBFR],
-    lpc_q12: [i32; tables::MAX_LPC_ORDER],
-    lpc_order: usize,
-}
-
-impl PlcUpdate {
-    /// Toma de `params` el tono y de `lpc_half` los coeficientes de la segunda mitad.
-    fn new(params: &decode_core::SilkFrameParams, lpc_half: &[i16; tables::MAX_LPC_ORDER]) -> Self {
-        let (lag, ltp_gains) = if params.signal_type == TYPE_VOICED {
-            voiced_pitch(params)
-        } else {
-            (0, [0; MAX_NB_SUBFR])
+        let input = plc::ConcealInput {
+            exc_q14: &core.exc_q14,
+            out_buf: &core.out_buf,
+            prev_signal_type: core.prev_signal_type,
+            first_frame_after_reset: self.first_frame_after_reset,
+            fs_khz,
+            lpc_order: tables::nlsf_codebook(fs_khz).order,
+            nb_subfr: self.indices.nb_subfr,
+            subfr_length: SUB_FRAME_LENGTH_MS * fs_khz as usize,
         };
-        let mut lpc_q12 = [0i32; tables::MAX_LPC_ORDER];
-        for (dst, &src) in lpc_q12.iter_mut().zip(lpc_half).take(params.lpc_order) {
-            *dst = i32::from(src);
-        }
-        Self {
-            lag,
-            ltp_gains,
-            lpc_q12,
-            lpc_order: params.lpc_order,
-        }
+        let lag = core.plc.conceal(&input, &mut core.s_lpc_q14_buf, pcm);
+        core.record_concealed_frame(pcm, fs_khz);
+        self.comfort_noise_and_glue(&[], pcm);
+        self.core.lag_prev = lag;
     }
-}
 
-/// Lag de tono de la última subtrama de una trama sonora y ganancia LTP de cada subtrama: la
-/// suma de los coeficientes de su filtro en Q14, acotada a `0..=ONE_Q16`.
-fn voiced_pitch(params: &decode_core::SilkFrameParams) -> (i32, [i32; MAX_NB_SUBFR]) {
-    let pitch_lags = pitch::decode_pitch_lags(
-        params.lag_index as i32,
-        params.contour_index as i32,
-        params.fs_khz as i32,
-        params.nb_subfr,
-    );
-    let (ltp_coeffs_q14, _) = ltp::decode_ltp_coeffs(
-        params.ltp_periodicity,
-        &params.ltp_indices,
-        params.nb_subfr,
-        params.ltp_scale_index,
-    );
-    let mut ltp_gains = [0i32; MAX_NB_SUBFR];
-    for (gain, coeffs) in ltp_gains
-        .iter_mut()
-        .zip(&ltp_coeffs_q14)
-        .take(params.nb_subfr)
-    {
-        let summed_q14 = coeffs
-            .iter()
-            .map(|coef| i32::from(*coef))
-            .sum::<i32>()
-            .max(0);
-        *gain = summed_q14.clamp(0, ONE_Q16);
+    /// Ruido de confort y fundido con la ocultación de la trama `pcm`, buena o perdida
+    /// (`silk_CNG` y `silk_PLC_glue_frames`). `gains_q16` son las ganancias de la trama buena.
+    fn comfort_noise_and_glue(&mut self, gains_q16: &[i32], pcm: &mut [i16]) {
+        let fs_khz = self.indices.fs_khz;
+        let core = &mut self.core;
+        let (plc_rand_scale_q14, plc_prev_gain_q16) = core.plc.noise_gain_inputs();
+        let input = cng::CngInput {
+            fs_khz,
+            lpc_order: tables::nlsf_codebook(fs_khz).order,
+            loss_cnt: core.plc.loss_cnt(),
+            prev_signal_type: core.prev_signal_type,
+            prev_nlsf_q15: &self.prev_nlsf_q15,
+            gains_q16,
+            nb_subfr: self.indices.nb_subfr,
+            subfr_length: SUB_FRAME_LENGTH_MS * fs_khz as usize,
+            exc_q14: &core.exc_q14,
+            plc_rand_scale_q14,
+            plc_prev_gain_q16,
+        };
+        core.cng.apply(&input, pcm);
+        core.plc.glue_frames(pcm);
     }
-    (pitch_lags[params.nb_subfr - 1], ltp_gains)
 }
 
 /// Decodificador SILK con estado, usado por el decodificador Opus.
@@ -332,25 +331,16 @@ impl SilkDecoder {
         self.final_range
     }
 
-    /// SILK solo remuestrea si la salida es de 48 kHz; a otra frecuencia copia el PCM interno tal
-    /// cual (heredado del original).
-    fn resamples(&self) -> bool {
-        self.fs_hz as usize == OPUS_RATE_HZ
-    }
-
     /// Muestras de cada trama interna ocultada: las de la última trama decodificada del canal 0,
     /// o `None` si todavía no se ha decodificado ninguna.
     fn concealment_frame_samples(&self) -> Option<usize> {
-        let plc = &self.channel_state[0].core.plc;
-        let samples = plc.subfr_length.saturating_mul(plc.nb_subfr);
-        (samples != 0 && plc.fs_khz > 0).then_some(samples)
+        let indices = &self.channel_state[0].indices;
+        let samples = indices.nb_subfr * SUB_FRAME_LENGTH_MS * indices.fs_khz as usize;
+        (samples != 0).then_some(samples)
     }
 
     /// Muestras por canal de salida que da una trama interna de `internal_samples` muestras.
     fn output_len(&self, internal_samples: usize) -> usize {
-        if !self.resamples() {
-            return internal_samples;
-        }
         self.channel_state[0]
             .resampler
             .as_ref()
@@ -369,7 +359,6 @@ impl SilkDecoder {
         &mut self,
         samples_per_channel: usize,
         out: &mut [i16],
-        loss_count: u32,
     ) -> Result<usize, Error> {
         let packet_channels = self.prev_packet_channels.clamp(1, 2) as usize;
         let needed = samples_per_channel * self.channels as usize;
@@ -391,8 +380,7 @@ impl SilkDecoder {
         let mut mono_history = self.stereo_state.s_mid;
         let mut written_total = 0usize;
         while written_total < samples_per_channel {
-            let internal_pcm =
-                self.conceal_internal_frame(packet_channels, frame_samples, loss_count);
+            let internal_pcm = self.conceal_internal_frame(packet_channels, frame_samples);
             let frame_write = frame_output_samples.min(samples_per_channel - written_total);
             let pcm = InternalPcm {
                 channels: [
@@ -401,6 +389,7 @@ impl SilkDecoder {
                 ],
                 packet_channels,
                 frame_length: frame_samples,
+                collapses_stereo: false,
             };
             self.emit(&pcm, &mut mono_history, out, written_total, frame_write);
             written_total += frame_write;
@@ -408,33 +397,85 @@ impl SilkDecoder {
         Ok(samples_per_channel)
     }
 
-    /// Oculta una trama interna de `frame_samples` muestras en cada canal del último paquete.
+    /// Oculta una trama interna de `frame_samples` muestras en cada canal del último paquete,
+    /// como `silk_Decode` de libopus con pérdida: el lateral se oculta si la trama anterior no
+    /// era solo de medio (y si lo era, se reinicia y queda en silencio); en estéreo, medio y
+    /// lateral pasan a izquierdo y derecho con la predicción anterior; y al final ningún canal
+    /// limita la bajada de la ganancia de la trama siguiente.
     fn conceal_internal_frame(
         &mut self,
         packet_channels: usize,
         frame_samples: usize,
-        loss_count: u32,
     ) -> [[i16; tables::MAX_FRAME_LENGTH]; 2] {
         let mut pcm = [[0i16; tables::MAX_FRAME_LENGTH]; 2];
-        for (channel, frame_pcm) in self
+        let stereo = packet_channels == 2;
+        if stereo && self.prev_decode_only_middle {
+            self.channel_state[1].reset_synthesis_history();
+        }
+        let has_side = !self.prev_decode_only_middle;
+        for (ch, (channel, frame_pcm)) in self
             .channel_state
             .iter_mut()
             .zip(pcm.iter_mut())
             .take(packet_channels)
+            .enumerate()
         {
-            channel.conceal(&mut frame_pcm[..frame_samples], loss_count);
+            if ch == 0 || has_side {
+                channel.conceal(&mut frame_pcm[..frame_samples]);
+            }
         }
-        if packet_channels == 1 {
-            self.stereo_state
-                .s_mid
-                .copy_from_slice(&pcm[0][frame_samples - 2..frame_samples]);
+        let pred_q13 = self.stereo_state.pred_prev_q13.map(i32::from);
+        let [left, right] = &mut pcm;
+        self.join_channels(
+            &mut left[..frame_samples],
+            &mut right[..frame_samples],
+            packet_channels,
+            pred_q13,
+        );
+        for channel in self.channel_state.iter_mut().take(packet_channels) {
+            channel.core.forget_last_gain_after_loss();
         }
         pcm
     }
 
+    /// Termina una trama interna de los canales del paquete: con un paquete y una salida estéreo,
+    /// pasa medio (`left`) y lateral (`right`) a izquierdo y derecho con la predicción
+    /// `pred_q13`; si no, guarda las dos últimas muestras del medio para retrasarlo una muestra al
+    /// remuestrear, y la salida es el medio, como en `silk_Decode` de libopus (`silk/dec_API.c`),
+    /// que solo convierte si `nChannelsAPI` y `nChannelsInternal` son 2.
+    fn join_channels(
+        &mut self,
+        left: &mut [i16],
+        right: &mut [i16],
+        packet_channels: usize,
+        pred_q13: [i32; 2],
+    ) {
+        if self.converts_to_left_right(packet_channels) {
+            stereo::ms_to_lr(
+                &mut self.stereo_state,
+                left,
+                right,
+                pred_q13,
+                self.channel_state[0].indices.fs_khz,
+            );
+        } else {
+            self.stereo_state
+                .s_mid
+                .copy_from_slice(&left[left.len() - 2..]);
+        }
+    }
+
+    /// Si el PCM interno de un paquete de `packet_channels` canales se convierte de medio y
+    /// lateral a izquierdo y derecho: solo con paquete y salida estéreo.
+    fn converts_to_left_right(&self, packet_channels: usize) -> bool {
+        packet_channels == 2 && self.channels == 2
+    }
+
     /// Escribe en `out`, desde la muestra por canal `first`, `count` muestras por canal del PCM
-    /// interno `pcm`, remuestreado si la salida es de 48 kHz. Con un paquete mono, el remuestreo
-    /// usa y actualiza `mono_history`.
+    /// interno `pcm`, remuestreado a la frecuencia de salida. Si no hay conversión a izquierdo y
+    /// derecho, sale el medio, y su remuestreo usa y actualiza `mono_history`; con salida estéreo,
+    /// el derecho lo copia, salvo en la primera trama interna de un paquete que colapsa el
+    /// estéreo (ver [`Self::collapses_stereo`]).
     fn emit(
         &mut self,
         pcm: &InternalPcm<'_>,
@@ -443,28 +484,18 @@ impl SilkDecoder {
         first: usize,
         count: usize,
     ) {
-        let stereo_packet = pcm.packet_channels == 2;
+        let left_right = self.converts_to_left_right(pcm.packet_channels);
         let stereo_out = self.channels == 2;
-        if !self.resamples() {
-            let copy_len = pcm.channels[0].len().min(count);
-            write_interleaved(
-                out,
-                first,
-                &pcm.channels[0][..copy_len],
-                stereo_packet.then_some(&pcm.channels[1][..copy_len]),
-                stereo_out,
-            );
-            return;
-        }
         let mut resampled = [[0i16; MAX_API_FRAME_SAMPLES_48K]; 2];
+        let mid_history = *mono_history;
         for (ch, channel) in self
             .channel_state
             .iter_mut()
             .enumerate()
-            .take(pcm.packet_channels)
+            .take(if left_right { 2 } else { 1 })
         {
             if let Some(resampler) = channel.resampler.as_mut() {
-                let history = (!stereo_packet).then_some(&mut *mono_history);
+                let history = (!left_right).then_some(&mut *mono_history);
                 resample_frames(
                     resampler,
                     pcm.channels[ch],
@@ -474,13 +505,49 @@ impl SilkDecoder {
                 );
             }
         }
+        let collapsed = stereo_out
+            && pcm.collapses_stereo
+            && self.resample_collapsed_right(pcm, mid_history, &mut resampled, count);
         write_interleaved(
             out,
             first,
             &resampled[0][..count],
-            stereo_packet.then_some(&resampled[1][..count]),
+            (left_right || collapsed).then_some(&resampled[1][..count]),
             stereo_out,
         );
+    }
+
+    /// Canal derecho de un paquete mono que colapsa el estéreo, en `resampled[1]`: la primera
+    /// trama interna del medio, retrasada desde `mid_history` como la del izquierdo, pasa por el
+    /// remuestreador del derecho, que conserva el estado del tramo estéreo; el resto, hasta
+    /// `count` muestras, copia el izquierdo de `resampled[0]`. Es lo que hace `silk_Decode` de
+    /// libopus con `stereo_to_mono`, que solo vale en la primera llamada del paquete. Devuelve
+    /// `false`, sin escribir, si el derecho no tiene remuestreador.
+    fn resample_collapsed_right(
+        &mut self,
+        pcm: &InternalPcm<'_>,
+        mut mid_history: [i16; 2],
+        resampled: &mut [[i16; MAX_API_FRAME_SAMPLES_48K]; 2],
+        count: usize,
+    ) -> bool {
+        let Some(resampler) = self.channel_state[1].resampler.as_mut() else {
+            return false;
+        };
+        let [left, right] = resampled;
+        let first_frame = &pcm.channels[0][..pcm.frame_length];
+        let written = resample_delayed(resampler, first_frame, right, &mut mid_history).min(count);
+        right[written..count].copy_from_slice(&left[written..count]);
+        true
+    }
+
+    /// Si un paquete de `packet_channels` canales a la frecuencia interna `internal_fs_hz` colapsa
+    /// el estéreo: es mono y sigue a uno estéreo a la misma frecuencia interna, como
+    /// `stereo_to_mono` en `silk_Decode` de libopus (`silk/dec_API.c`). Se decide antes de fijar
+    /// la frecuencia del paquete; tras un reinicio no hay frecuencia anterior y no colapsa.
+    fn collapses_stereo(&self, packet_channels: usize, internal_fs_hz: u32) -> bool {
+        packet_channels == 1
+            && self.prev_packet_channels == 2
+            && self.channel_state[0].indices.fs_khz * HZ_PER_KHZ == internal_fs_hz
     }
 
     /// Decodifica la parte SILK de una trama híbrida con el decodificador de rango compartido
@@ -496,7 +563,7 @@ impl SilkDecoder {
         request: SilkFrameRequest,
         out: &mut [i16],
     ) -> Result<usize, Error> {
-        let samples_per_channel = self.decode_payload(dec, request, out)?;
+        let samples_per_channel = self.decode_payload(dec, request, SilkPayload::Main, out)?;
         self.finish(dec)?;
         Ok(samples_per_channel)
     }
@@ -515,9 +582,10 @@ impl SilkDecoder {
         Ok(())
     }
 
-    /// Decodifica las tramas internas del paquete y escribe su PCM en `out`; devuelve las muestras
-    /// por canal de salida. No cierra la trama: el llamador lee lo que quede (la cola de
-    /// redundancia de una trama solo SILK) y llama a [`Self::finish`].
+    /// Decodifica las tramas internas del paquete, las principales o las LBRR según `payload`, y
+    /// escribe su PCM en `out`; devuelve las muestras por canal de salida. No cierra la trama: el
+    /// llamador lee lo que quede (la cola de redundancia de una trama solo SILK) y llama a
+    /// [`Self::finish`].
     ///
     /// # Errores
     ///
@@ -526,6 +594,7 @@ impl SilkDecoder {
         &mut self,
         dec: &mut EcDec<'_>,
         request: SilkFrameRequest,
+        payload: SilkPayload,
         out: &mut [i16],
     ) -> Result<usize, Error> {
         let SilkFrameRequest {
@@ -550,23 +619,33 @@ impl SilkDecoder {
             });
         }
 
+        let collapses_stereo = self.collapses_stereo(packet_channels, internal_fs_hz);
         self.prepare_channels(packet_channels, internal_fs_hz, nb_subfr)?;
         let header = parse_header(dec, packet_channels, internal_frames)?;
-        consume_lbrr_payload(
-            dec,
-            &header,
-            packet_channels,
-            internal_frames,
-            &mut self.channel_state,
-            frame_length,
-        )?;
         let layout = FrameLayout {
             packet_channels,
             frame_length,
         };
         let mut internal_pcm = [[0i16; INTERNAL_PCM_LEN]; 2];
-        for i in 0..internal_frames {
-            self.decode_internal_frame(dec, &header, layout, i, &mut internal_pcm)?;
+        match payload {
+            SilkPayload::Main => {
+                consume_lbrr_payload(
+                    dec,
+                    &header,
+                    packet_channels,
+                    internal_frames,
+                    &mut self.channel_state,
+                    frame_length,
+                )?;
+                for i in 0..internal_frames {
+                    self.decode_internal_frame(dec, &header, layout, i, &mut internal_pcm)?;
+                }
+            }
+            SilkPayload::Lbrr => {
+                for i in 0..internal_frames {
+                    self.decode_lbrr_internal_frame(dec, &header, layout, i, &mut internal_pcm)?;
+                }
+            }
         }
 
         out[..needed].fill(0);
@@ -578,15 +657,18 @@ impl SilkDecoder {
             ],
             packet_channels,
             frame_length,
+            collapses_stereo,
         };
         self.emit(&pcm, &mut mono_history, out, 0, samples_per_channel);
         self.prev_packet_channels = packet_channels as u8;
         Ok(samples_per_channel)
     }
 
-    /// Prepara los canales del paquete para la frecuencia interna `internal_fs_hz` y, a 48 kHz,
-    /// sus remuestreadores. Al pasar de un paquete mono a uno estéreo con salida estéreo, se
-    /// borra la predicción estéreo y el canal derecho parte del remuestreador del izquierdo.
+    /// Prepara los canales del paquete para la frecuencia interna `internal_fs_hz` y sus
+    /// remuestreadores. Al pasar de un paquete mono a uno estéreo, el canal derecho empieza
+    /// de cero, como en `silk_Decode` de libopus (`silk_init_decoder`), sea cual sea la salida;
+    /// con salida estéreo, además, se borra la predicción estéreo y el canal derecho parte del
+    /// remuestreador del izquierdo.
     ///
     /// # Errores
     ///
@@ -598,11 +680,11 @@ impl SilkDecoder {
         nb_subfr: usize,
     ) -> Result<(), Error> {
         let fs_khz = internal_fs_hz / HZ_PER_KHZ;
+        if packet_channels == 2 && self.prev_packet_channels == 1 {
+            self.channel_state[1].restart();
+        }
         for channel in self.channel_state.iter_mut().take(packet_channels) {
             channel.set_internal_rate(fs_khz, nb_subfr);
-        }
-        if !self.resamples() {
-            return Ok(());
         }
         let api_fs_hz = self.fs_hz;
         for channel in self.channel_state.iter_mut().take(packet_channels) {
@@ -618,8 +700,8 @@ impl SilkDecoder {
     }
 
     /// Decodifica la trama interna `i` de los canales del paquete en `internal_pcm`: predicción
-    /// estéreo, cada canal, la conversión de medio y lateral a izquierdo y derecho y la
-    /// actualización de la ocultación.
+    /// estéreo, cada canal (con su ocultación y su ruido de confort) y la conversión de medio y
+    /// lateral a izquierdo y derecho.
     ///
     /// # Errores
     ///
@@ -643,56 +725,132 @@ impl SilkDecoder {
             pred_q13 = stereo::decode_stereo_pred(dec);
             decode_only_middle = !header.channels[1].vad_flags[i] && stereo::decode_mid_only(dec);
             if !decode_only_middle && self.prev_decode_only_middle {
-                self.channel_state[1].reset_side_after_mid_only();
+                self.channel_state[1].reset_synthesis_history();
             }
         }
 
-        let mut pending: [Option<PlcUpdate>; 2] = [None, None];
-        for ch in 0..packet_channels {
+        let channels = self
+            .channel_state
+            .iter_mut()
+            .zip(internal_pcm.iter_mut())
+            .zip(&header.channels)
+            .take(packet_channels);
+        for (ch, ((channel, pcm), channel_header)) in channels.enumerate() {
             if ch == 1 && decode_only_middle {
                 continue;
             }
             let frame = InternalFrame {
                 index: i,
-                vad: header.channels[ch].vad_flags[i],
+                vad: channel_header.vad_flags[i],
+                lbrr: false,
                 cond: main_cond_coding(i, ch, self.prev_decode_only_middle),
                 frame_length,
             };
-            pending[ch] = Some(self.channel_state[ch].decode_internal_frame(
-                dec,
-                frame,
-                &mut internal_pcm[ch][range.clone()],
-            )?);
+            channel.decode_internal_frame(dec, frame, &mut pcm[range.clone()])?;
         }
 
-        if packet_channels == 2 {
-            let [left, right] = &mut *internal_pcm;
-            stereo::ms_to_lr(
-                &mut self.stereo_state,
-                &mut left[range.clone()],
-                &mut right[range.clone()],
-                pred_q13,
-                self.channel_state[0].indices.fs_khz,
-            );
-        } else {
-            self.stereo_state
-                .s_mid
-                .copy_from_slice(&internal_pcm[0][range.end - 2..range.end]);
-        }
-
-        for ((channel, update), pcm) in self
-            .channel_state
-            .iter_mut()
-            .zip(&pending)
-            .zip(internal_pcm.iter())
-        {
-            if let Some(update) = update {
-                channel.update_plc(update, &pcm[range.clone()]);
-            }
-        }
+        let [left, right] = &mut *internal_pcm;
+        self.join_channels(
+            &mut left[range.clone()],
+            &mut right[range],
+            packet_channels,
+            pred_q13,
+        );
         self.prev_decode_only_middle = decode_only_middle;
         Ok(())
     }
+
+    /// Decodifica la trama LBRR de la trama interna `frame.index` en `internal_pcm`, como
+    /// `silk_Decode` de libopus con `lostFlag == FLAG_DECODE_LBRR`: la predicción estéreo y el
+    /// indicador de solo medio son los de la LBRR si el canal medio la trae (si no, se repite la
+    /// predicción anterior); el lateral se decodifica si la trama anterior no era solo de medio o
+    /// si trae LBRR; y la trama de un canal sin LBRR se oculta.
+    ///
+    /// # Errores
+    ///
+    /// `BadPacket` si los índices o los pulsos de una trama LBRR no se pueden decodificar.
+    fn decode_lbrr_internal_frame(
+        &mut self,
+        dec: &mut EcDec<'_>,
+        header: &ParsedHeader,
+        layout: FrameLayout,
+        i: usize,
+        internal_pcm: &mut [[i16; INTERNAL_PCM_LEN]; 2],
+    ) -> Result<(), Error> {
+        let FrameLayout {
+            packet_channels,
+            frame_length,
+        } = layout;
+        let range = i * frame_length..(i + 1) * frame_length;
+        let lbrr = |ch: usize| header.channels[ch].lbrr_flags[i];
+        let mut pred_q13 = self.stereo_state.pred_prev_q13.map(i32::from);
+        let mut decode_only_middle = false;
+        if packet_channels == 2 {
+            if lbrr(0) {
+                pred_q13 = stereo::decode_stereo_pred(dec);
+                decode_only_middle = !lbrr(1) && stereo::decode_mid_only(dec);
+            }
+            if !decode_only_middle && self.prev_decode_only_middle {
+                self.channel_state[1].reset_synthesis_history();
+            }
+        }
+        let has_side = lbrr_has_side(
+            self.prev_decode_only_middle,
+            packet_channels == 2 && lbrr(1),
+        );
+
+        let channels = self
+            .channel_state
+            .iter_mut()
+            .zip(internal_pcm.iter_mut())
+            .zip(&header.channels)
+            .take(packet_channels);
+        for (ch, ((channel, pcm), channel_header)) in channels.enumerate() {
+            if ch == 1 && !has_side {
+                continue;
+            }
+            let pcm = &mut pcm[range.clone()];
+            if !channel_header.lbrr_flags[i] {
+                channel.conceal(pcm);
+                continue;
+            }
+            let lbrr_frame = InternalFrame {
+                index: i,
+                vad: channel_header.vad_flags[i],
+                lbrr: true,
+                cond: lbrr_cond_coding(i, &channel_header.lbrr_flags),
+                frame_length,
+            };
+            channel.decode_internal_frame(dec, lbrr_frame, pcm)?;
+        }
+
+        let [left, right] = &mut *internal_pcm;
+        self.join_channels(
+            &mut left[range.clone()],
+            &mut right[range],
+            packet_channels,
+            pred_q13,
+        );
+        self.prev_decode_only_middle = decode_only_middle;
+        Ok(())
+    }
+}
+
+/// Codificación condicional de la trama LBRR interna `i` de un canal con indicadores
+/// `lbrr_flags`, como `silk_Decode` de libopus con `FLAG_DECODE_LBRR`: la primera, independiente;
+/// las demás, condicionadas si la trama anterior del canal también trae LBRR.
+fn lbrr_cond_coding(i: usize, lbrr_flags: &[bool; MAX_INTERNAL_FRAMES]) -> indices::CondCoding {
+    if i > 0 && lbrr_flags[i - 1] {
+        indices::CondCoding::Conditionally
+    } else {
+        indices::CondCoding::Independently
+    }
+}
+
+/// Si se decodifica el canal lateral de una trama LBRR, como `has_side` en `silk_Decode` de
+/// libopus: cuando la trama anterior no era solo de medio o cuando el lateral trae LBRR.
+fn lbrr_has_side(prev_decode_only_middle: bool, side_has_lbrr: bool) -> bool {
+    !prev_decode_only_middle || side_has_lbrr
 }
 
 /// Codificación condicional de la trama interna `i` del canal `ch`, en el orden de `silk_Decode`
@@ -969,6 +1127,67 @@ mod tests {
     use crate::test_vectors::{read_opus_demo_records, vectors_dir};
 
     const TV02_PKT0_LPC_Q12: [i16; 10] = [5041, -1246, 1017, -614, 431, -560, 131, -357, 284, -46];
+    /// Frecuencia de salida de las pruebas que preparan canales (remuestreo a 48 kHz).
+    const OUTPUT_48K_HZ: u32 = 48_000;
+    /// Frecuencia interna de banda ancha y subtramas de una trama de 20 ms.
+    const WIDEBAND_HZ: u32 = 16_000;
+    const SUBFRAMES_20_MS: usize = 4;
+    /// Ganancia anterior cualquiera distinta de la inicial: solo la borra un reinicio completo.
+    const STALE_PREV_GAIN_Q16: i32 = 1234;
+
+    /// Al pasar de un paquete mono a uno estéreo, el canal derecho empieza de cero también con
+    /// salida mono: `silk_Decode` de libopus llama a `silk_init_decoder(&channel_state[1])` sin
+    /// mirar los canales de salida. Con salida estéreo lo vigila además el oráculo `empalmes`
+    /// (`tests/referencia_libopus.rs`); con salida mono, solo esta prueba.
+    #[test]
+    fn mono_to_stereo_restarts_right_channel_with_any_output() {
+        for channels in [1, 2] {
+            let mut decoder = SilkDecoder::new(OUTPUT_48K_HZ, channels);
+            for channel in &mut decoder.channel_state {
+                channel.set_internal_rate(WIDEBAND_HZ / HZ_PER_KHZ, SUBFRAMES_20_MS);
+            }
+            let stale = &mut decoder.channel_state[1];
+            stale.core.prev_gain_q16 = STALE_PREV_GAIN_Q16;
+            stale.first_frame_after_reset = false;
+
+            decoder
+                .prepare_channels(2, WIDEBAND_HZ, SUBFRAMES_20_MS)
+                .unwrap();
+
+            let right = &decoder.channel_state[1];
+            let initial = SilkChannel::default();
+            assert_eq!(
+                right.core.prev_gain_q16, initial.core.prev_gain_q16,
+                "{channels} canales"
+            );
+            assert!(right.first_frame_after_reset, "{channels} canales");
+        }
+    }
+
+    /// Un cambio de frecuencia interna reinicia solo la historia de la síntesis, como
+    /// `silk_decoder_set_fs` de libopus: la ganancia anterior y la excitación se conservan.
+    #[test]
+    fn internal_rate_change_keeps_gain_and_excitation() {
+        const NARROWBAND_KHZ: u32 = 8;
+        const STALE_EXCITATION_Q14: i32 = -77;
+        let mut channel = SilkChannel::default();
+        channel.set_internal_rate(NARROWBAND_KHZ, SUBFRAMES_20_MS);
+        channel.core.prev_gain_q16 = STALE_PREV_GAIN_Q16;
+        channel.core.exc_q14.fill(STALE_EXCITATION_Q14);
+        channel.first_frame_after_reset = false;
+
+        channel.set_internal_rate(WIDEBAND_HZ / HZ_PER_KHZ, SUBFRAMES_20_MS);
+
+        assert_eq!(channel.core.prev_gain_q16, STALE_PREV_GAIN_Q16);
+        assert!(
+            channel
+                .core
+                .exc_q14
+                .iter()
+                .all(|&e| e == STALE_EXCITATION_Q14)
+        );
+        assert!(channel.first_frame_after_reset);
+    }
 
     /// El reinicio del canal lateral tras una trama solo de medio hace que la trama siguiente no
     /// interpole las NLSF, como `first_frame_after_reset = 1` en `silk_Decode`. Ni la red de
@@ -979,7 +1198,7 @@ mod tests {
             first_frame_after_reset: false,
             ..SilkChannel::default()
         };
-        channel.reset_side_after_mid_only();
+        channel.reset_synthesis_history();
         assert!(channel.first_frame_after_reset);
     }
 
@@ -1011,6 +1230,43 @@ mod tests {
                         "trama {i}, canal {ch}, anterior solo medio: {prev}"
                     );
                 }
+            }
+        }
+    }
+
+    /// Codificación condicional y `has_side` de `silk_Decode` (`silk/dec_API.c`, v1.6.1) con
+    /// `FLAG_DECODE_LBRR`, con sus mismas condiciones, como oráculo: `FrameIndex <= 0` da
+    /// independiente; si no, condicionada si la LBRR anterior del canal existe.
+    fn libopus_lbrr_cond_coding(frame_index: usize, lbrr_flags: [bool; 3]) -> indices::CondCoding {
+        if frame_index == 0 {
+            indices::CondCoding::Independently
+        } else if lbrr_flags[frame_index - 1] {
+            indices::CondCoding::Conditionally
+        } else {
+            indices::CondCoding::Independently
+        }
+    }
+
+    #[test]
+    fn lbrr_cond_coding_matches_libopus() {
+        for bits in 0u8..8 {
+            let flags = [bits & 1 != 0, bits & 2 != 0, bits & 4 != 0];
+            for i in 0..MAX_INTERNAL_FRAMES {
+                assert_eq!(
+                    lbrr_cond_coding(i, &flags),
+                    libopus_lbrr_cond_coding(i, flags),
+                    "trama {i}, indicadores LBRR {flags:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn lbrr_has_side_matches_libopus() {
+        // `has_side = !prev_decode_only_middle || (estéreo && LBRR lateral)`.
+        for prev in [false, true] {
+            for side_lbrr in [false, true] {
+                assert_eq!(lbrr_has_side(prev, side_lbrr), !prev || side_lbrr);
             }
         }
     }

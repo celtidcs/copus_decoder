@@ -13,6 +13,7 @@ use std::collections::BTreeMap;
 use std::panic::{self, AssertUnwindSafe};
 use std::sync::Once;
 
+use common::Generador;
 use copus_decoder::{OpusDecoder, OpusMultistreamDecoder};
 
 /// Semilla del generador; fija para que los casos sean reproducibles.
@@ -31,27 +32,6 @@ const MAX_BYTES_TRAMA: usize = 1_275;
 const MAX_CARGA_TRAS_TOC: usize = 400;
 /// Paquetes por configuración de salida en la prueba sintética.
 const PAQUETES_POR_CONFIGURACION: usize = 1_500;
-
-/// Generador xorshift64*: suficiente para variar la entrada y sin dependencias externas.
-struct Generador(u64);
-
-impl Generador {
-    fn siguiente(&mut self) -> u64 {
-        self.0 ^= self.0 >> 12;
-        self.0 ^= self.0 << 25;
-        self.0 ^= self.0 >> 27;
-        self.0.wrapping_mul(0x2545_F491_4F6C_DD1D)
-    }
-
-    /// Entero uniforme en `0..n` (`n > 0`).
-    fn hasta(&mut self, n: usize) -> usize {
-        (self.siguiente() % n as u64) as usize
-    }
-
-    fn bytes(&mut self, n: usize) -> Vec<u8> {
-        (0..n).map(|_| self.siguiente() as u8).collect()
-    }
-}
 
 thread_local! {
     /// Verdadero mientras este hilo ejecuta un caso aislado.
@@ -250,44 +230,13 @@ fn no_panico_paquetes_sinteticos() {
     registro.comprobar("no_panico_paquetes_sinteticos");
 }
 
-/// Paquetes híbridos de una trama, uno por configuración (12 a 15), cuya redundancia anunciada no
-/// cabe en la trama. Se hallaron con una búsqueda aleatoria de 400 000 paquetes, en `release` y con
-/// la comprobación de cordura desactivada a propósito: con ella quitada, cada uno hace entrar en
-/// pánico al decodificador. El bit de redundancia de un paquete híbrido tiene probabilidad 1/4096
-/// (RFC 6716 §4.5.1), así que el corpus aleatorio de las otras pruebas casi nunca llega a ese camino.
-const PAQUETES_REDUNDANCIA_QUE_NO_CABE: [&[u8]; 4] = [
-    &[
-        96, 67, 50, 20, 112, 124, 91, 35, 54, 240, 226, 28, 116, 243, 158, 9, 177, 185, 103, 252,
-        104, 196, 127, 236, 111, 216, 89, 45, 129, 245, 133, 122, 66, 61, 247, 114, 49, 216, 1,
-    ],
-    &[
-        104, 58, 181, 155, 204, 61, 41, 109, 160, 74, 100, 136, 2, 174, 125, 34, 246, 59, 247, 132,
-        19, 225, 162, 21, 230, 174, 4, 6, 178, 250, 55, 7, 123, 28, 129, 233, 58, 29, 143, 189,
-        111, 73, 29, 230, 139, 249, 203, 215, 2, 212, 134, 209, 157, 121, 139, 226, 234, 101, 26,
-        182, 42, 31, 175, 158, 245, 60, 96, 114, 89, 57, 34, 51, 125, 245, 167, 188, 253, 46, 56,
-        138, 46,
-    ],
-    &[
-        112, 101, 100, 215, 39, 63, 140, 221, 88, 178, 225, 152, 175, 115, 191, 162, 39, 109, 223,
-        189, 39, 61, 38, 162, 138, 194, 80, 0, 92, 9, 195, 27, 127, 58, 139, 77, 105, 231, 235,
-        194, 17, 158, 149, 16, 208, 79, 236, 14, 39, 88, 88, 58, 216, 110, 224, 26, 96, 196, 60,
-        45, 195, 18, 17, 109, 51, 136, 184, 112, 171, 234, 192, 226, 198, 235, 185, 105, 50,
-    ],
-    &[
-        120, 140, 112, 32, 248, 255, 137, 53, 238, 24, 250, 238, 55, 238, 127, 82, 185, 59, 204,
-        175, 120, 169, 100, 144, 67, 70, 237, 125, 189, 102, 229, 9, 69, 223, 41, 203, 202, 94,
-        127, 49, 108, 229, 89, 123, 70, 133, 41, 118, 122, 56, 243, 213, 27, 81, 40, 40, 106, 98,
-        169, 162, 28, 103, 46, 197, 81,
-    ],
-];
-
 /// Regresión de la comprobación de cordura de la redundancia híbrida (`opus_decode_frame` en
 /// libopus): cada paquete se decodifica con un decodificador recién creado.
 #[test]
 fn no_panico_redundancia_hibrida() {
     instalar_gancho();
     let mut registro = Registro::default();
-    for (i, paquete) in PAQUETES_REDUNDANCIA_QUE_NO_CABE.iter().enumerate() {
+    for (i, paquete) in common::PAQUETES_REDUNDANCIA_QUE_NO_CABE.iter().enumerate() {
         registro.ejecutar(
             || format!("paquete híbrido {i} (configuración {})", paquete[0] >> 3),
             || {

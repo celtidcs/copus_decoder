@@ -68,8 +68,9 @@ Ejecutar cargo test --release --all-features
 
 Paso 'Listo'
 Write-Host @"
-Pruebas con los vectores (conformidad RFC 8251 y red de equivalencia):
+Pruebas con los vectores (conformidad RFC 8251, diferencia frente a libopus y red de equivalencia):
   `$env:OPUS_TESTVECTORS_DIR = '$DirVectores'
   cargo test --release --test conformance_rfc -- --ignored rfc_conformance_vectors
+  cargo test --release --test diferencia_libopus -- --ignored
   cargo test --release --test red_equivalencia -- --ignored
 "@

@@ -1,10 +1,12 @@
 //! Reconstrucción de la excitación de SILK y síntesis LPC.
 
+use super::cng::CngState;
 use super::fixed::{
-    add_sat32, div32_var_q, inverse32_var_q, rshift_round, sat16, silk_rand, smlawb, smulbb,
+    add_sat32, div32_var_q, inverse32_var_q, lshift_sat32, rshift_round, sat16, silk_rand, smlawb,
     smulwb, smulww,
 };
 use super::gain;
+use super::lpc::lpc_analysis_filter;
 use super::ltp;
 use super::pitch;
 use super::plc::SilkPlcState;
@@ -18,6 +20,25 @@ use super::tables::{
 /// último índice de ganancia 10 y lag anterior 100 (`silk_decoder_set_fs`).
 const INITIAL_LAST_GAIN_INDEX: i8 = 10;
 const INITIAL_LAG_PREV: i32 = 100;
+/// Coeficiente central del filtro de tono con que se suaviza el paso de una ocultación sonora a
+/// una trama no sonora: 0,25 en Q14 (`silk_decode_core`).
+const VOICED_TO_UNVOICED_LTP_Q14: i16 = 4_096;
+/// Subtramas que dura ese suavizado (`MAX_NB_SUBFR / 2`).
+const VOICED_TO_UNVOICED_SUBFRAMES: usize = MAX_NB_SUBFR / 2;
+
+/// Control de una trama interna decodificada (`silk_decoder_control`): lo que la síntesis saca
+/// de los parámetros y necesitan después la ocultación y el ruido de confort.
+#[derive(Debug, Clone, Default)]
+pub(super) struct FrameControl {
+    /// Ganancia de cada subtrama, en Q16.
+    pub gains_q16: [i32; MAX_NB_SUBFR],
+    /// Lag de tono de cada subtrama; cero en las no sonoras.
+    pub pitch_l: [i32; MAX_NB_SUBFR],
+    /// Coeficientes del filtro de tono de cada subtrama, en Q14.
+    pub ltp_coef_q14: [[i16; LTP_ORDER]; MAX_NB_SUBFR],
+    /// Escala LTP de la trama, en Q14; cero si no es sonora.
+    pub ltp_scale_q14: i32,
+}
 
 /// Parámetros decodificados de una trama interna de SILK que necesita la síntesis.
 #[derive(Debug, Clone)]
@@ -70,31 +91,35 @@ pub(super) struct SilkChannelState {
     /// Salida reciente del canal, con la que se reblanquea la historia del filtro de tono en las
     /// tramas sonoras.
     pub out_buf: [i16; MAX_FRAME_LENGTH + 2 * MAX_SUB_FRAME_LENGTH],
+    /// Excitación de la última trama decodificada, en Q14 (`exc_Q14`). Cada trama escribe solo
+    /// sus muestras: detrás queda lo de las anteriores, del que la ocultación también saca ruido.
+    pub exc_q14: [i32; MAX_FRAME_LENGTH],
     /// Estado de la ocultación de pérdidas, que se actualiza tras cada trama decodificada.
     pub plc: SilkPlcState,
+    /// Estado del ruido de confort.
+    pub cng: CngState,
 }
 
 impl SilkChannelState {
-    /// Añade la trama ocultada `frame` a la salida reciente, como una decodificada, y recuerda el
-    /// lag de tono de la ocultación si lo tiene.
-    pub(super) fn record_concealed_frame(&mut self, frame: &[i16]) {
-        let ltp_mem_length = self.plc.fs_khz as u32 as usize * LTP_MEM_LENGTH_MS;
-        let frame_len = frame.len();
-        let mv_len = ltp_mem_length.saturating_sub(frame_len);
-        if mv_len > 0 {
-            self.out_buf.copy_within(frame_len..frame_len + mv_len, 0);
-        }
-        self.out_buf[mv_len..mv_len + frame_len].copy_from_slice(frame);
-        if self.plc.pitch_lag > 0 {
-            self.lag_prev = self.plc.pitch_lag;
-        }
+    /// Añade la trama ocultada `frame` a la salida reciente, como una decodificada
+    /// (`silk_decode_frame`), a la frecuencia interna `fs_khz`.
+    pub(super) fn record_concealed_frame(&mut self, frame: &[i16], fs_khz: u32) {
+        let ltp_mem_length = fs_khz as usize * LTP_MEM_LENGTH_MS;
+        push_output(&mut self.out_buf, ltp_mem_length, frame);
     }
 
-    /// Reinicia la síntesis del canal lateral cuando vuelve a codificarse tras una trama solo de
-    /// medio, como `silk_Decode` de libopus: borra la salida reciente y la memoria LPC, y devuelve
+    /// Tras una pérdida, la primera trama buena no limita cuánto baja la ganancia, para que la
+    /// energía no rebote si se perdieron paquetes mientras bajaba (`silk_Decode` de libopus).
+    pub(super) fn forget_last_gain_after_loss(&mut self) {
+        self.last_gain_index = INITIAL_LAST_GAIN_INDEX;
+    }
+
+    /// Reinicia la historia de la síntesis: borra la salida reciente y la memoria LPC, y devuelve
     /// a sus valores iniciales el lag, el último índice de ganancia y el tipo de señal anterior.
-    /// Conserva la ganancia anterior y el estado de la ocultación.
-    pub(super) fn reset_side_after_mid_only(&mut self) {
+    /// Conserva la ganancia anterior, la excitación y el estado de la ocultación y del ruido de
+    /// confort. Es lo que libopus reinicia en el canal lateral cuando vuelve a codificarse tras
+    /// una trama solo de medio (`silk_Decode`).
+    pub(super) fn reset_synthesis_history(&mut self) {
         self.out_buf.fill(0);
         self.s_lpc_q14_buf.fill(0);
         self.lag_prev = INITIAL_LAG_PREV;
@@ -114,7 +139,9 @@ impl Default for SilkChannelState {
             lag_prev: INITIAL_LAG_PREV,
             s_lpc_q14_buf: [0; MAX_LPC_ORDER],
             out_buf: [0; MAX_FRAME_LENGTH + 2 * MAX_SUB_FRAME_LENGTH],
+            exc_q14: [0; MAX_FRAME_LENGTH],
             plc: SilkPlcState::default(),
+            cng: CngState::default(),
         }
     }
 }
@@ -136,10 +163,11 @@ const LTP_SCALE_Q29_TO_Q31_SHIFT: u32 = 2;
 /// `SMULWW` de la señal en Q14 por la ganancia en Q10 da Q8, que se redondea a Q0.
 const OUTPUT_Q8_SHIFT: usize = 8;
 
-/// Filtro de tono de una trama: lags, coeficientes y escala LTP. En tramas no sonoras es todo
-/// cero y no se aplica.
+/// Filtro de tono de una trama: si se aplica en cada subtrama, lags, coeficientes y escala LTP.
+/// En tramas no sonoras es todo cero y no se aplica, salvo en el paso de una ocultación sonora a
+/// una trama no sonora (ver [`PitchFilter::smooth_after_voiced_loss`]).
 struct PitchFilter {
-    voiced: bool,
+    voiced: [bool; MAX_NB_SUBFR],
     pitch_lags: [i32; MAX_NB_SUBFR],
     ltp_coeffs_q14: [[i16; LTP_ORDER]; MAX_NB_SUBFR],
     ltp_scale_q14: i32,
@@ -149,7 +177,7 @@ impl PitchFilter {
     fn new(params: &SilkFrameParams) -> Self {
         if params.signal_type != TYPE_VOICED {
             return Self {
-                voiced: false,
+                voiced: [false; MAX_NB_SUBFR],
                 pitch_lags: [0; MAX_NB_SUBFR],
                 ltp_coeffs_q14: [[0; LTP_ORDER]; MAX_NB_SUBFR],
                 ltp_scale_q14: 0,
@@ -168,22 +196,40 @@ impl PitchFilter {
             params.ltp_scale_index,
         );
         Self {
-            voiced: true,
+            voiced: [true; MAX_NB_SUBFR],
             pitch_lags,
             ltp_coeffs_q14,
             ltp_scale_q14,
         }
     }
+
+    /// Tras ocultar tramas sonoras, la primera trama buena no sonora conserva el tono en sus dos
+    /// primeras subtramas, con un solo coeficiente de 0,25 y el lag anterior, para evitar un salto
+    /// brusco (`silk_decode_core`).
+    fn smooth_after_voiced_loss(&mut self, params: &SilkFrameParams, state: &SilkChannelState) {
+        let after_voiced_loss = state.plc.loss_cnt() > 0
+            && state.prev_signal_type == TYPE_VOICED
+            && params.signal_type != TYPE_VOICED;
+        if !after_voiced_loss {
+            return;
+        }
+        for k in 0..VOICED_TO_UNVOICED_SUBFRAMES.min(params.nb_subfr) {
+            self.voiced[k] = true;
+            self.pitch_lags[k] = state.lag_prev;
+            self.ltp_coeffs_q14[k] = [0; LTP_ORDER];
+            self.ltp_coeffs_q14[k][LTP_ORDER / 2] = VOICED_TO_UNVOICED_LTP_Q14;
+        }
+    }
 }
 
-/// Reconstruye la excitación en Q14 a partir de los pulsos: cada pulso se acerca a cero en
-/// `QUANT_LEVEL_ADJUST_Q10`, se le suma el desplazamiento del cuantificador y su signo se invierte
-/// según el generador pseudoaleatorio (`silk_decode_core`).
-fn excitation(params: &SilkFrameParams) -> [i32; MAX_FRAME_LENGTH] {
+/// Reconstruye en `exc_q14[..frame_length]` la excitación en Q14 a partir de los pulsos: cada
+/// pulso se acerca a cero en `QUANT_LEVEL_ADJUST_Q10`, se le suma el desplazamiento del
+/// cuantificador y su signo se invierte según el generador pseudoaleatorio (`silk_decode_core`).
+/// El resto de `exc_q14` no se toca.
+fn excitation(params: &SilkFrameParams, exc_q14: &mut [i32; MAX_FRAME_LENGTH]) {
     let offset_q10 = QUANTIZATION_OFFSETS_Q10[(params.signal_type >> 1) as usize]
         [params.quant_offset_type as usize];
     let mut rand_seed = params.seed as i32;
-    let mut exc_q14 = [0i32; MAX_FRAME_LENGTH];
     for (exc, &pulse) in exc_q14
         .iter_mut()
         .zip(&params.pulses[..params.frame_length])
@@ -202,7 +248,6 @@ fn excitation(params: &SilkFrameParams) -> [i32; MAX_FRAME_LENGTH] {
         rand_seed = rand_seed.wrapping_add(pulse as i32);
         *exc = sample;
     }
-    exc_q14
 }
 
 /// Estado de trabajo de la síntesis de una trama: la memoria del filtro LPC y la historia del
@@ -230,10 +275,12 @@ impl<'a> Synthesis<'a> {
         let ltp_mem_length = params.fs_khz as usize * LTP_MEM_LENGTH_MS;
         let mut s_lpc_q14 = [0i32; MAX_LPC_ORDER + MAX_SUB_FRAME_LENGTH];
         s_lpc_q14[..MAX_LPC_ORDER].copy_from_slice(&state.s_lpc_q14_buf);
+        let mut filter = PitchFilter::new(params);
+        filter.smooth_after_voiced_loss(params, state);
         Self {
             params,
             lpc_coeffs_q12,
-            filter: PitchFilter::new(params),
+            filter,
             subfr_length: params.frame_length / params.nb_subfr,
             ltp_mem_length,
             nlsf_interpolation: lpc_coeffs_q12[0][..params.lpc_order]
@@ -255,7 +302,7 @@ impl<'a> Synthesis<'a> {
         state: &mut SilkChannelState,
     ) {
         let gain_adj_q16 = self.rescale_lpc_memory(gain_q16, state);
-        if self.filter.voiced {
+        if self.filter.voiced[k] {
             self.update_ltp_history(k, gain_q16, gain_adj_q16, output_pcm, state);
         }
         let range = k * self.subfr_length..(k + 1) * self.subfr_length;
@@ -339,7 +386,7 @@ impl<'a> Synthesis<'a> {
         let mut pres_q14 = [0i32; MAX_SUB_FRAME_LENGTH];
         pres_q14[..subfr_length].copy_from_slice(exc_subframe);
         let pitch_lag = self.filter.pitch_lags[k];
-        if self.filter.voiced && pitch_lag > 0 {
+        if self.filter.voiced[k] && pitch_lag > 0 {
             ltp::ltp_filter(
                 &mut pres_q14[..subfr_length],
                 exc_subframe,
@@ -373,7 +420,8 @@ impl<'a> Synthesis<'a> {
                     a as i32,
                 );
             }
-            let current_q14 = add_sat32(pres, lpc_pred_q10 << Q10_TO_Q14_SHIFT);
+            let current_q14 =
+                add_sat32(pres, lshift_sat32(lpc_pred_q10, Q10_TO_Q14_SHIFT as usize));
             self.s_lpc_q14[MAX_LPC_ORDER + i] = current_q14;
             *pcm = sat16(rshift_round(smulww(current_q14, gain_q10), OUTPUT_Q8_SHIFT));
         }
@@ -382,75 +430,71 @@ impl<'a> Synthesis<'a> {
             .copy_within(subfr_length..subfr_length + MAX_LPC_ORDER, 0);
     }
 
-    /// Guarda en el estado del canal la memoria LPC, el tipo de señal, el último lag y la salida
-    /// de la trama, para la siguiente trama y para la ocultación.
-    fn finish(self, output_pcm: &[i16], state: &mut SilkChannelState) {
+    /// Guarda en el estado del canal la memoria LPC, el tipo de señal y la salida de la trama,
+    /// para la siguiente trama y para la ocultación, y devuelve el control de la trama.
+    fn finish(
+        self,
+        output_pcm: &[i16],
+        gains_q16: [i32; MAX_NB_SUBFR],
+        state: &mut SilkChannelState,
+    ) -> FrameControl {
         let params = self.params;
         state
             .s_lpc_q14_buf
             .copy_from_slice(&self.s_lpc_q14[..MAX_LPC_ORDER]);
         state.prev_signal_type = params.signal_type;
-        let last_lag = self.filter.pitch_lags[params.nb_subfr - 1];
-        if self.filter.voiced && last_lag > 0 {
-            state.lag_prev = last_lag;
+        push_output(
+            &mut state.out_buf,
+            self.ltp_mem_length,
+            &output_pcm[..params.frame_length],
+        );
+        // Como `silk_decode_parameters`, los coeficientes y la escala son los de los parámetros:
+        // el suavizado tras una ocultación sonora solo deja su huella en el lag (`pitchL`).
+        let decoded = PitchFilter::new(params);
+        FrameControl {
+            gains_q16,
+            pitch_l: self.filter.pitch_lags,
+            ltp_coef_q14: decoded.ltp_coeffs_q14,
+            ltp_scale_q14: decoded.ltp_scale_q14,
         }
-        let mv_len = self.ltp_mem_length.saturating_sub(params.frame_length);
-        if mv_len > 0 {
-            state
-                .out_buf
-                .copy_within(params.frame_length..params.frame_length + mv_len, 0);
-        }
-        state.out_buf[mv_len..mv_len + params.frame_length]
-            .copy_from_slice(&output_pcm[..params.frame_length]);
     }
+}
+
+/// Añade `frame` al final de la salida reciente `out_buf`, de `ltp_mem_length` muestras útiles,
+/// desplazando hacia el principio lo que cabe de la anterior.
+fn push_output(out_buf: &mut [i16], ltp_mem_length: usize, frame: &[i16]) {
+    let frame_len = frame.len();
+    let mv_len = ltp_mem_length.saturating_sub(frame_len);
+    if mv_len > 0 {
+        out_buf.copy_within(frame_len..frame_len + mv_len, 0);
+    }
+    out_buf[mv_len..mv_len + frame_len].copy_from_slice(frame);
 }
 
 /// Decodifica una trama interna de SILK a PCM a la frecuencia interna (`silk_decode_core`):
 /// excitación, filtro de tono en tramas sonoras y filtro de síntesis LPC, subtrama a subtrama.
 ///
 /// `lpc_coeffs_q12` son los coeficientes de cada mitad de la trama. Escribe la trama en
-/// `output_pcm` y actualiza el estado del canal.
+/// `output_pcm`, actualiza el estado del canal y devuelve el control de la trama.
 pub(super) fn decode_core(
     params: &SilkFrameParams,
     lpc_coeffs_q12: &[[i16; MAX_LPC_ORDER]; 2],
     output_pcm: &mut [i16],
     state: &mut SilkChannelState,
-) {
+) -> FrameControl {
     let gains_q16 = gain::decode_gains(
         &params.gain_indices[..params.nb_subfr],
         &mut state.last_gain_index,
         params.conditional,
         params.nb_subfr,
     );
-    let exc_q14 = excitation(params);
+    excitation(params, &mut state.exc_q14);
+    let exc_q14 = state.exc_q14;
     let mut synthesis = Synthesis::new(params, lpc_coeffs_q12, state);
     for (k, &gain_q16) in gains_q16.iter().enumerate().take(params.nb_subfr) {
         synthesis.subframe(k, gain_q16, &exc_q14, output_pcm, state);
     }
-    synthesis.finish(output_pcm, state);
-}
-
-/// Filtro de análisis LPC (`silk_LPC_analysis_filter`) con el que se reblanquean las tramas
-/// sonoras: escribe en `output[..len]` el residuo en Q0 de `input` con los coeficientes `a_q12`
-/// de orden `order`. Las `order` primeras muestras quedan a cero.
-fn lpc_analysis_filter(output: &mut [i16], input: &[i16], a_q12: &[i16], len: usize, order: usize) {
-    debug_assert!(order <= len);
-    output[..order].fill(0);
-    for ix in order..len {
-        let mut out32_q12 = smulbb(input[ix - 1] as i32, a_q12[0] as i32);
-        out32_q12 = out32_q12.wrapping_add(smulbb(input[ix - 2] as i32, a_q12[1] as i32));
-        out32_q12 = out32_q12.wrapping_add(smulbb(input[ix - 3] as i32, a_q12[2] as i32));
-        out32_q12 = out32_q12.wrapping_add(smulbb(input[ix - 4] as i32, a_q12[3] as i32));
-        out32_q12 = out32_q12.wrapping_add(smulbb(input[ix - 5] as i32, a_q12[4] as i32));
-        out32_q12 = out32_q12.wrapping_add(smulbb(input[ix - 6] as i32, a_q12[5] as i32));
-        for j in (6..order).step_by(2) {
-            out32_q12 = out32_q12.wrapping_add(smulbb(input[ix - 1 - j] as i32, a_q12[j] as i32));
-            out32_q12 =
-                out32_q12.wrapping_add(smulbb(input[ix - 2 - j] as i32, a_q12[j + 1] as i32));
-        }
-        let out32_q12 = ((input[ix] as i32) << 12).wrapping_sub(out32_q12);
-        output[ix] = sat16(rshift_round(out32_q12, 12));
-    }
+    synthesis.finish(output_pcm, gains_q16, state)
 }
 
 #[cfg(test)]
@@ -459,30 +503,27 @@ mod tests {
     use crate::silk::tables::{LTP_MEM_LENGTH_MS, TYPE_NO_VOICE_ACTIVITY, TYPE_VOICED};
 
     /// Frecuencia interna de las pruebas, en kHz: la historia de tono es de 160 muestras.
-    const FS_KHZ: i32 = 8;
+    const FS_KHZ: u32 = 8;
     /// Trama ocultada de las pruebas: la mitad de la historia de tono.
     const FRAME_LEN: usize = 80;
-    /// Lag de tono de una ocultación sonora, distinto del inicial.
-    const CONCEALED_LAG: i32 = 77;
+    /// Lag de tono distinto del inicial.
+    const SOME_LAG: i32 = 77;
 
-    /// Estado con la salida reciente numerada (muestra `i` = `i`) y la ocultación a `FS_KHZ`.
-    fn numbered_state(pitch_lag: i32) -> SilkChannelState {
+    /// Estado con la salida reciente numerada (muestra `i` = `i`).
+    fn numbered_state() -> SilkChannelState {
         let mut state = SilkChannelState::default();
         for (i, sample) in state.out_buf.iter_mut().enumerate() {
             *sample = i as i16;
         }
-        state.plc.fs_khz = FS_KHZ;
-        state.plc.pitch_lag = pitch_lag;
         state
     }
 
-    /// La trama ocultada entra al final de la historia de tono, que avanza lo que dura la trama,
-    /// y su lag pasa a ser el anterior.
+    /// La trama ocultada entra al final de la historia de tono, que avanza lo que dura la trama.
     #[test]
-    fn concealed_frame_enters_history_and_lag() {
-        let mut state = numbered_state(CONCEALED_LAG);
+    fn concealed_frame_enters_history() {
+        let mut state = numbered_state();
         let frame: Vec<i16> = (0..FRAME_LEN).map(|i| -(i as i16) - 1).collect();
-        state.record_concealed_frame(&frame);
+        state.record_concealed_frame(&frame, FS_KHZ);
 
         let ltp_mem_length = FS_KHZ as usize * LTP_MEM_LENGTH_MS;
         let kept = ltp_mem_length - FRAME_LEN;
@@ -490,7 +531,6 @@ mod tests {
             assert_eq!(state.out_buf[i], (i + FRAME_LEN) as i16, "muestra {i}");
         }
         assert_eq!(&state.out_buf[kept..ltp_mem_length], &frame[..]);
-        assert_eq!(state.lag_prev, CONCEALED_LAG);
     }
 
     /// Ganancia anterior de la prueba de reinicio, distinta de la inicial (1,0 en Q16).
@@ -498,17 +538,17 @@ mod tests {
 
     /// El reinicio del canal lateral borra la salida reciente y la memoria LPC y devuelve el lag,
     /// el último índice de ganancia y el tipo de señal a sus valores iniciales; la ganancia
-    /// anterior y la ocultación se conservan, como en `silk_Decode` de libopus.
+    /// anterior se conserva, como en `silk_Decode` de libopus.
     #[test]
     fn side_reset_after_mid_only_clears_synthesis_history() {
-        let mut state = numbered_state(CONCEALED_LAG);
+        let mut state = numbered_state();
         state.s_lpc_q14_buf.fill(-7);
-        state.lag_prev = CONCEALED_LAG;
+        state.lag_prev = SOME_LAG;
         state.last_gain_index = INITIAL_LAST_GAIN_INDEX + 5;
         state.prev_signal_type = TYPE_VOICED;
         state.prev_gain_q16 = KEPT_GAIN_Q16;
 
-        state.reset_side_after_mid_only();
+        state.reset_synthesis_history();
 
         assert!(state.out_buf.iter().all(|&sample| sample == 0));
         assert!(state.s_lpc_q14_buf.iter().all(|&value| value == 0));
@@ -516,14 +556,16 @@ mod tests {
         assert_eq!(state.last_gain_index, INITIAL_LAST_GAIN_INDEX);
         assert_eq!(state.prev_signal_type, TYPE_NO_VOICE_ACTIVITY);
         assert_eq!(state.prev_gain_q16, KEPT_GAIN_Q16);
-        assert_eq!(state.plc.pitch_lag, CONCEALED_LAG);
     }
 
-    /// Una ocultación sin lag de tono (trama sorda) no cambia el lag anterior.
+    /// Tras una pérdida, el último índice de ganancia vuelve al inicial.
     #[test]
-    fn unvoiced_concealment_keeps_previous_lag() {
-        let mut state = numbered_state(0);
-        state.record_concealed_frame(&[0; FRAME_LEN]);
-        assert_eq!(state.lag_prev, INITIAL_LAG_PREV);
+    fn loss_forgets_last_gain_index() {
+        let mut state = SilkChannelState {
+            last_gain_index: INITIAL_LAST_GAIN_INDEX + 20,
+            ..SilkChannelState::default()
+        };
+        state.forget_last_gain_after_loss();
+        assert_eq!(state.last_gain_index, INITIAL_LAST_GAIN_INDEX);
     }
 }

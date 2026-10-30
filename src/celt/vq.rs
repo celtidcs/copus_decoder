@@ -1,6 +1,7 @@
 //! Decodificación de los vectores PVQ de CELT y su rotación de dispersión (`vq.c`).
 
 use crate::celt::cwrs;
+use crate::celt::x86_kernels::inner_prod_sse;
 use crate::entropy::EcDec;
 
 /// Modo de dispersión de CELT sin rotación (`SPREAD_NONE`).
@@ -8,9 +9,9 @@ pub(crate) const SPREAD_NONE: i32 = 0;
 /// La rotación de segundo nivel solo se aplica a bandas de al menos 8 bloques del paso
 /// (`len>=8*stride` en `exp_rotation`).
 const ROTATION_STRIDE2_MIN_BLOCKS: usize = 8;
-/// Energía mínima al renormalizar, para no dividir por cero. Heredada de la implementación
-/// original; libopus suma `EPSILON` en lugar de acotar y **no se ha comprobado** si difiere.
-const RENORMALISE_MIN_ENERGY: f32 = 1e-12;
+/// Energía que libopus suma al renormalizar para no dividir por cero (`EPSILON` en coma
+/// flotante, `arch.h`).
+const RENORMALISE_EPSILON: f32 = 1e-15;
 
 /// Una etapa de la rotación exponencial (`exp_rotation1`): gira cada par de coeficientes
 /// separados `stride` con el coseno `c` y el seno `s`, hacia delante y después hacia atrás.
@@ -36,6 +37,13 @@ fn exp_rotation1(x: &mut [f32], stride: usize, c: f32, s: f32) {
     }
 }
 
+/// Coseno de `½π·x` como `celt_cos_norm` de libopus en coma flotante (`celt/mathops.h`): calculado
+/// en `f64` (allí `PI` es un `double`) y convertido a `f32`. Calcularlo en `f32` cambia el último
+/// bit de la rotación y, por ella, la salida.
+fn celt_cos_norm(x: f32) -> f32 {
+    (core::f64::consts::FRAC_PI_2 * f64::from(x)).cos() as f32
+}
+
 /// Rotación de dispersión de CELT (`exp_rotation`): reparte la energía de una banda con pocos
 /// pulsos entre sus coeficientes. El ángulo depende de los pulsos `k` y del modo de dispersión;
 /// `dir` elige el sentido.
@@ -47,9 +55,9 @@ fn exp_rotation(x: &mut [f32], dir: i32, stride: usize, k: i32, spread: i32) {
     let factor = SPREAD_FACTOR[(spread - 1) as usize];
     let gain = x.len() as f32 / (x.len() as f32 + factor as f32 * k as f32);
     let theta = 0.5 * gain * gain;
-    let angle = core::f32::consts::FRAC_PI_2 * theta;
-    let c = angle.cos();
-    let s = angle.sin();
+    let c = celt_cos_norm(theta);
+    // Seno de ½π·θ como coseno del complementario, con `1 − θ` en `f32`, como libopus.
+    let s = celt_cos_norm(1.0 - theta);
     let mut stride2 = 0usize;
     if x.len() >= ROTATION_STRIDE2_MIN_BLOCKS * stride {
         stride2 = 1;
@@ -83,7 +91,8 @@ fn normalise_residual(iy: &[i32], x: &mut [f32], gain: f32) -> u32 {
     let scale = if ryy == 0 {
         0.0
     } else {
-        gain / (ryy as f32).sqrt()
+        // Como libopus: el inverso de la raíz por la ganancia, no la ganancia entre la raíz.
+        (1.0 / (ryy as f32).sqrt()) * gain
     };
     for (dst, &src) in x.iter_mut().zip(iy.iter()) {
         *dst = src as f32 * scale;
@@ -131,14 +140,11 @@ pub(crate) fn alg_unquant(
     extract_collapse_mask(&pulses, x.len(), b.max(1))
 }
 
-/// Escala el vector para que su norma sea `gain` (`renormalise_vector`).
+/// Escala el vector para que su norma sea `gain` (`renormalise_vector`), con la energía sumada
+/// como `celt_inner_prod_sse`, que es el producto escalar que usa libopus x86.
 pub(crate) fn renormalise_vector(x: &mut [f32], gain: f32) {
-    let e = x
-        .iter()
-        .map(|v| v * v)
-        .sum::<f32>()
-        .max(RENORMALISE_MIN_ENERGY);
-    let g = gain / e.sqrt();
+    let e = RENORMALISE_EPSILON + inner_prod_sse(x, x, x.len());
+    let g = (1.0 / e.sqrt()) * gain;
     for v in x.iter_mut() {
         *v *= g;
     }

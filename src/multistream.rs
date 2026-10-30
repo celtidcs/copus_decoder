@@ -3,6 +3,8 @@
 //!
 //! Sigue la lógica de `opus_multistream_decoder.c` de libopus.
 
+use std::borrow::Cow;
+
 use crate::packet;
 use crate::{OpusDecoder, OpusError};
 
@@ -109,9 +111,14 @@ impl OpusMultistreamDecoder {
     /// Decodifica un paquete multiflujo en PCM `i16` entrelazado.
     ///
     /// `pcm` recibe las muestras de los `nb_channels` canales de salida, entrelazadas, en el
-    /// orden del mapa de canales. Con `fec` a `true`, o con un paquete vacío, se oculta una
-    /// pérdida: la corrección de errores de la banda (FEC) aún no se usa. Devuelve las muestras
-    /// por canal.
+    /// orden del mapa de canales. Un paquete vacío oculta una pérdida en todos los flujos. Con
+    /// `fec` a `true`, `packet` es el paquete que sigue a una pérdida y cada flujo la recupera con
+    /// la corrección de errores de la banda (FEC) de su subpaquete, como
+    /// [`OpusDecoder::decode`] con `fec` y como `opus_multistream_decode` de libopus: la salida dura
+    /// lo que el último paquete y, si el subpaquete no trae con qué recuperarla (o dura más que la
+    /// pérdida), ese flujo la oculta. Ahí libopus devolvería `OPUS_BUFFER_TOO_SMALL`, porque recibe
+    /// la duración pedida; aquí se oculta, como en un solo flujo. Devuelve las muestras por
+    /// canal.
     ///
     /// # Errores
     ///
@@ -142,6 +149,9 @@ impl OpusMultistreamDecoder {
 
     /// Decodifica un paquete multiflujo en PCM `f32` entrelazado; por lo demás, como
     /// [`OpusMultistreamDecoder::decode`].
+    ///
+    /// En esta versión, la salida es la de [`OpusMultistreamDecoder::decode`] dividida entre
+    /// 32 768: tiene la resolución de 16 bits, no la de la salida en coma flotante de libopus.
     ///
     /// # Errores
     ///
@@ -178,8 +188,8 @@ impl OpusMultistreamDecoder {
         fec: bool,
         decode_stream: StreamDecode<T>,
     ) -> Result<usize, OpusError> {
-        let sub_packets = if packet.is_empty() || fec {
-            vec![&[][..]; self.nb_streams]
+        let sub_packets = if packet.is_empty() {
+            vec![Cow::Borrowed(&[][..]); self.nb_streams]
         } else {
             split_multistream_packet(packet, self.nb_streams)?
         };
@@ -236,21 +246,38 @@ impl OpusMultistreamDecoder {
         }
     }
 
-    /// Muestras por canal que dará el paquete: las de la última trama si se oculta una pérdida
-    /// y, si no, las de sus subpaquetes, que han de coincidir.
+    /// Muestras por canal que dará la llamada: las de sus subpaquetes, que han de coincidir, o
+    /// las del último paquete si se oculta o se recupera con FEC una pérdida. Con FEC, los
+    /// subpaquetes se validan igual, como en libopus.
     ///
     /// # Errores
     ///
     /// `InvalidPacket` si algún subpaquete no es válido o los subpaquetes duran distinto.
-    fn expected_frame_size(&self, sub_packets: &[&[u8]], fec: bool) -> Result<usize, OpusError> {
-        if fec || sub_packets.iter().all(|packet| packet.is_empty()) {
-            return Ok(self
+    fn expected_frame_size(
+        &self,
+        sub_packets: &[Cow<'_, [u8]>],
+        fec: bool,
+    ) -> Result<usize, OpusError> {
+        match self.sub_packet_samples(sub_packets)? {
+            Some(samples) if !fec => Ok(samples),
+            _ => Ok(self
                 .decoders
                 .first()
                 .map(OpusDecoder::last_packet_duration)
-                .unwrap_or(0));
+                .unwrap_or(0)),
         }
+    }
 
+    /// Muestras por canal de los subpaquetes no vacíos, que han de coincidir; `None` si todos
+    /// están vacíos.
+    ///
+    /// # Errores
+    ///
+    /// `InvalidPacket` si algún subpaquete no es válido o los subpaquetes duran distinto.
+    fn sub_packet_samples(
+        &self,
+        sub_packets: &[Cow<'_, [u8]>],
+    ) -> Result<Option<usize>, OpusError> {
         let mut frame_size = None;
         for sub_packet in sub_packets.iter().filter(|packet| !packet.is_empty()) {
             let samples = packet::parse_packet(sub_packet)
@@ -265,7 +292,7 @@ impl OpusMultistreamDecoder {
             }
         }
 
-        Ok(frame_size.unwrap_or(0))
+        Ok(frame_size)
     }
 
     /// Canales del flujo `stream_idx`: 2 si es acoplado y 1 si es mono.
@@ -288,48 +315,42 @@ impl OpusMultistreamDecoder {
     }
 }
 
-/// Parte un paquete multiflujo en un subpaquete por flujo, en orden: todos menos el último
-/// llevan delante su longitud (RFC 6716, apéndice B) y el último ocupa el resto.
+/// Parte un paquete multiflujo en un subpaquete por flujo, en orden, como
+/// `opus_multistream_decode_native` de libopus: todos menos el último van autodelimitados
+/// (RFC 6716, apéndice B; [`packet::split_self_delimited`]) y se devuelven en el formato normal;
+/// el último ocupa el resto. Un paquete vacío da un subpaquete vacío (ocultación) por flujo.
 ///
 /// # Errores
 ///
-/// `InvalidArgument` si no hay flujos e `InvalidPacket` si una longitud falta o se sale del
-/// paquete.
-fn split_multistream_packet(packet: &[u8], nb_streams: usize) -> Result<Vec<&[u8]>, OpusError> {
+/// `InvalidArgument` si no hay flujos, e `InvalidPacket` si el paquete es más corto que
+/// `2 * nb_streams - 1` bytes (el mínimo de libopus), si un subpaquete autodelimitado no es
+/// válido o se sale del paquete, o si no queda nada para el último flujo.
+fn split_multistream_packet(
+    packet: &[u8],
+    nb_streams: usize,
+) -> Result<Vec<Cow<'_, [u8]>>, OpusError> {
     if nb_streams == 0 {
         return Err(OpusError::InvalidArgument("nb_streams"));
     }
     if packet.is_empty() {
-        return Ok(vec![packet; nb_streams]);
+        return Ok(vec![Cow::Borrowed(packet); nb_streams]);
+    }
+    if packet.len() < 2 * nb_streams - 1 {
+        return Err(OpusError::InvalidPacket);
     }
 
     let mut out = Vec::with_capacity(nb_streams);
-    let mut offset = 0usize;
-    for _stream_idx in 0..nb_streams.saturating_sub(1) {
-        let (packet_len, used) = parse_self_delimited_size(&packet[offset..])?;
-        offset += used;
-        if offset + packet_len > packet.len() {
-            return Err(OpusError::InvalidPacket);
-        }
-        out.push(&packet[offset..offset + packet_len]);
-        offset += packet_len;
+    let mut rest = packet;
+    for _stream_idx in 1..nb_streams {
+        let (sub_packet, used) = packet::split_self_delimited(rest).map_err(OpusError::from)?;
+        out.push(Cow::Owned(sub_packet));
+        rest = &rest[used..];
     }
-
-    if offset > packet.len() {
+    if rest.is_empty() {
         return Err(OpusError::InvalidPacket);
     }
-    out.push(&packet[offset..]);
+    out.push(Cow::Borrowed(rest));
     Ok(out)
-}
-
-/// Lee la longitud de un subpaquete autodelimitado, con la misma codificación de uno o dos
-/// bytes que las longitudes de trama (RFC 6716, apéndice B). Devuelve `(longitud, bytes_leídos)`.
-///
-/// # Errores
-///
-/// `InvalidPacket` si faltan bytes.
-fn parse_self_delimited_size(data: &[u8]) -> Result<(usize, usize), OpusError> {
-    packet::parse_size(data).map_err(OpusError::from)
 }
 
 /// Forma de un búfer entrelazado: `stride` canales y `frame_size` muestras por canal.
@@ -368,12 +389,30 @@ impl Interleaved {
 mod tests {
     use super::*;
 
-    /// Paquete de dos flujos con la longitud del primero en un byte.
+    /// Paquete de dos flujos en el formato de libopus: el primero, `[0x08, 10, 11]` (código 0),
+    /// lleva la longitud de su trama (2) tras el TOC; el segundo, `[0x08, 20]`, va normal.
     #[test]
-    fn split_two_stream_packet_with_short_prefix() {
-        let packet = [3u8, 10, 11, 12, 20, 21];
+    fn split_two_stream_packet_in_libopus_format() {
+        let packet = [0x08, 2, 10, 11, 0x08, 20];
         let sub_packets = split_multistream_packet(&packet, 2).unwrap();
-        assert_eq!(sub_packets, vec![&[10, 11, 12][..], &[20, 21][..]]);
+        assert_eq!(sub_packets, vec![&[0x08, 10, 11][..], &[0x08, 20][..]]);
+    }
+
+    /// Con relleno (código 3, una trama): la longitud autodelimitada va tras el byte de cuenta y
+    /// la longitud del relleno, y el relleno sigue a la trama y pertenece al primer flujo.
+    #[test]
+    fn split_self_delimited_sub_packet_with_padding() {
+        let first = [0x0B, 0x41, 2, 7, 8, 0, 0];
+        let packet = [0x0B, 0x41, 2, 2, 7, 8, 0, 0, 0x08, 20];
+        let sub_packets = split_multistream_packet(&packet, 2).unwrap();
+        assert_eq!(sub_packets, vec![&first[..], &[0x08, 20][..]]);
+    }
+
+    /// Sin bytes para el último flujo, o más corto que `2 * nb_streams - 1`, no es válido.
+    #[test]
+    fn split_rejects_missing_last_stream() {
+        assert!(split_multistream_packet(&[0x08, 0, 0x08], 3).is_err());
+        assert!(split_multistream_packet(&[0x08, 1, 10], 2).is_err());
     }
 
     /// Un paquete vacío da un subpaquete vacío (ocultación) por flujo.

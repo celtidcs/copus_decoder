@@ -173,3 +173,32 @@ pub(super) fn inverse32_var_q(value: i32, q_res: usize) -> i32 {
         0
     }
 }
+
+/// Raíz cuadrada aproximada con error menor del 10 % para resultados mayores de 15
+/// (`silk_SQRT_APPROX`, `silk/Inlines.h`). Devuelve 0 si `x` no es positivo.
+pub(super) fn sqrt_approx(x: i32) -> i32 {
+    /// Raíz de 2 en Q15: el punto de partida cuando los ceros a la izquierda son pares.
+    const SQRT2_Q15: i32 = 46_214;
+    /// 1,0 en Q15: el punto de partida cuando son impares.
+    const ONE_Q15: i32 = 32_768;
+    /// Pendiente de la corrección lineal con la parte fraccionaria, en Q7.
+    const FRAC_SLOPE: i32 = 213;
+    if x <= 0 {
+        return 0;
+    }
+    let (lz, frac_q7) = clz_frac(x);
+    let mut y = if lz & 1 != 0 { ONE_Q15 } else { SQRT2_Q15 };
+    y >>= lz >> 1;
+    smlawb(y, y, smulbb(FRAC_SLOPE, frac_q7))
+}
+
+/// Ceros a la izquierda de `value` y los 7 bits que siguen al primer uno (`silk_CLZ_FRAC`).
+fn clz_frac(value: i32) -> (i32, i32) {
+    /// Posición, contada desde el bit menos significativo, en la que la rotación deja los 7 bits
+    /// que siguen al primer uno.
+    const FRAC_POSITION: i32 = 24;
+    let lz = value.leading_zeros() as i32;
+    let rotation = (FRAC_POSITION - lz).rem_euclid(32) as u32;
+    let frac_q7 = ((value as u32).rotate_right(rotation) & 0x7f) as i32;
+    (lz, frac_q7)
+}

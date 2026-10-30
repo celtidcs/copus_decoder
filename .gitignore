@@ -3,6 +3,12 @@
 **/*.rs.bk
 *.pdb
 
+# Fuzzing (cargo-fuzz): compilación, corpus, fallos guardados y cobertura
+fuzz/target/
+fuzz/corpus/
+fuzz/artifacts/
+fuzz/coverage/
+
 # Todo lo que no se publica: compilación, temporales, vectores de prueba descargados
 material_secundario/
 

@@ -8,6 +8,7 @@ use crate::celt::modes::CeltMode;
 use crate::celt::quant_bands::{self, EnergyFrame};
 use crate::celt::rate;
 use crate::celt::vq;
+use crate::celt::x86_kernels::inner_prod_sse;
 use crate::entropy::{BITRES, EcDec, ec_ilog};
 
 const QTHETA_OFFSET: i32 = 4;
@@ -440,8 +441,9 @@ fn special_hybrid_folding_decode(
 /// `y` el lateral ya escalado y `mid` la ganancia del medio. Cada canal sale con norma unidad;
 /// si alguno no tiene energía, los dos quedan iguales al medio.
 fn stereo_merge_float(x: &mut [f32], y: &mut [f32], mid: f32) {
-    let xp = x.iter().zip(y.iter()).map(|(a, b)| a * b).sum::<f32>() * mid;
-    let side_energy = y.iter().map(|v| v * v).sum::<f32>();
+    // Los dos productos escalares, con `celt_inner_prod_sse` como libopus x86.
+    let xp = inner_prod_sse(y, x, x.len()) * mid;
+    let side_energy = inner_prod_sse(y, y, y.len());
     let el = mid * mid + side_energy - 2.0 * xp;
     let er = mid * mid + side_energy + 2.0 * xp;
     if er < STEREO_MERGE_MIN_ENERGY || el < STEREO_MERGE_MIN_ENERGY {
@@ -689,6 +691,11 @@ impl PartitionDecoder<'_, '_> {
         }
         let qalloc = self.dec.tell_frac() as i32 - tell_before;
         *b -= qalloc;
+        // En los ángulos extremos, libopus pone `imid` o `iside` a 32767, no a 32768
+        // (`compute_theta`, `celt/bands.c`), y la ganancia es `imid / 32768`. En las bandas de
+        // dos coeficientes no hay `stereo_merge` que renormalice, y esa diferencia llega a la
+        // salida.
+        let extreme_gain = (Q15_ONE as f32) * (1.0 / Q15_SCALE);
         if itheta == 0 {
             *fill &= (1u32 << blocks) - 1;
             return StereoTheta {
@@ -696,7 +703,7 @@ impl PartitionDecoder<'_, '_> {
                 delta: -ITHETA_QUARTER_TURN,
                 qalloc,
                 itheta,
-                mid_gain: 1.0,
+                mid_gain: extreme_gain,
                 side_gain: 0.0,
             };
         }
@@ -708,7 +715,7 @@ impl PartitionDecoder<'_, '_> {
                 qalloc,
                 itheta,
                 mid_gain: 0.0,
-                side_gain: 1.0,
+                side_gain: extreme_gain,
             };
         }
         let imid = bitexact_cos(itheta);
@@ -1541,7 +1548,11 @@ pub(crate) fn quant_all_bands_stereo(
 }
 
 /// Desnormaliza las bandas `bands` del espectro `x` en `freq` con la energía decodificada
-/// `band_loge` (log2) de cada una (`denormalise_bands`). Lo que queda fuera de `bands` no se toca.
+/// `band_loge` (log2) de cada una (`denormalise_bands`). Lo que queda por debajo de `bands` no se
+/// toca; desde el final de `bands` o desde el Nyquist de la salida diezmada `downsample` veces,
+/// lo que llegue antes, el espectro se anula, como libopus (`celt/bands.c` 197–200): la síntesis
+/// toma después una de cada `downsample` muestras sin filtrar, y lo que quedara por encima se
+/// replegaría.
 pub(crate) fn denormalise_bands(
     mode: &CeltMode,
     x: &[f32],
@@ -1549,8 +1560,10 @@ pub(crate) fn denormalise_bands(
     band_loge: &[f32],
     bands: Range<usize>,
     lm: usize,
+    downsample: usize,
 ) {
     let m = 1usize << lm;
+    let bound = (m * mode.e_bands[bands.end] as usize).min(freq.len() / downsample);
     for (i, &loge) in bands.clone().zip(&band_loge[bands]) {
         let j0 = m * mode.e_bands[i] as usize;
         let j1 = m * mode.e_bands[i + 1] as usize;
@@ -1560,6 +1573,7 @@ pub(crate) fn denormalise_bands(
             freq[j] = x[j] * g;
         }
     }
+    freq[bound..].fill(0.0);
 }
 
 #[cfg(test)]
@@ -1585,11 +1599,39 @@ mod tests {
         band_loge[0] = LG_HIGH - e_means()[0];
         band_loge[1] = LG_LOW - e_means()[1];
 
-        denormalise_bands(mode, &x, &mut freq, &band_loge, 0..2, 0);
+        denormalise_bands(mode, &x, &mut freq, &band_loge, 0..2, 0, 1);
 
         let band0 = mode.e_bands[0] as usize..mode.e_bands[1] as usize;
         let band1 = mode.e_bands[1] as usize..len;
         assert!(freq[band0].iter().all(|&g| g == 2.0f32.powi(32)));
         assert!(freq[band1].iter().all(|&g| g == 2.0f32.powf(LG_LOW)));
+    }
+
+    /// Diezmado de 48 a 16 kHz: Nyquist a 8 kHz.
+    const DOWNSAMPLE_16K: usize = 3;
+
+    /// Como `denormalise_bands` de libopus (`celt/bands.c` 197–200): con diezmado, el espectro
+    /// queda a cero desde `N/downsample` aunque las bandas sigan, y también lo que hubiera allí.
+    #[test]
+    fn denormalise_clears_above_downsampled_nyquist() {
+        let mode = mode48000_960_120();
+        let len = mode.e_bands[mode.nb_ebands] as usize;
+        let bound = len / DOWNSAMPLE_16K;
+        let x = vec![1.0f32; len];
+        let mut freq = vec![1.0f32; len];
+        let band_loge = vec![0.0f32; mode.nb_ebands];
+
+        denormalise_bands(
+            mode,
+            &x,
+            &mut freq,
+            &band_loge,
+            0..mode.nb_ebands,
+            0,
+            DOWNSAMPLE_16K,
+        );
+
+        assert!(freq[..bound].iter().all(|&g| g != 0.0));
+        assert!(freq[bound..].iter().all(|&g| g == 0.0));
     }
 }

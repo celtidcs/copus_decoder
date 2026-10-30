@@ -2,7 +2,7 @@
 //! síntesis (`compute_inv_mdcts` de `celt/celt_decoder.c` en libopus).
 
 use super::modes::CeltMode;
-use super::{CeltDecoder, DECODE_BUFFER_SIZE, MAX_LM, lm_for_frame_size, mdct, mdct_size};
+use super::{CeltDecoder, DECODE_BUFFER_SIZE, MAX_LM, lm_for_frame_size, mdct};
 use crate::Error;
 
 /// Forma temporal de la trama que se sintetiza.
@@ -18,7 +18,7 @@ pub(super) struct SynthesisShape {
 
 /// Una MDCT inversa por cada duración de trama, con la ventana y el solape del modo.
 ///
-/// Invariante: `by_lm[lm]` transforma `mdct_size(lm)` coeficientes, así que `by_lm[0]` es la del
+/// Invariante: `by_lm[lm]` es la MDCT de `2 · 120 << lm` muestras (`shift` = `MAX_LM - lm`), así que `by_lm[0]` es la del
 /// bloque corto de 120 muestras.
 #[derive(Debug, Clone)]
 pub(super) struct MdctBank {
@@ -31,7 +31,7 @@ impl MdctBank {
     /// Prepara las cuatro MDCT inversas del modo.
     pub(super) fn new(mode: &'static CeltMode) -> Self {
         Self {
-            by_lm: std::array::from_fn(|lm| mdct::MdctBackward::new(mdct_size(lm), mode.overlap)),
+            by_lm: std::array::from_fn(|lm| mdct::MdctBackward::new(MAX_LM - lm, mode.overlap)),
             window: mode.window,
             overlap: mode.overlap,
         }

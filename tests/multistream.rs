@@ -140,3 +140,121 @@ fn multistream_matches_stream_decoders() {
         "i16, ocultación"
     );
 }
+
+/// Paquetes de cada clase que debe recorrer la barrera del formato autodelimitado, para que no
+/// pierda cobertura sin que se note: código 1, código 3 de tasa constante, código 3 con relleno
+/// y paquetes de más de 1275 bytes (sus tramas sí caben en una longitud autodelimitada).
+#[derive(Debug, Default)]
+struct Cobertura {
+    codigo1: usize,
+    codigo3_constante: usize,
+    relleno: usize,
+    mayores_de_1275: usize,
+}
+
+impl Cobertura {
+    fn contar(&mut self, packet: &[u8]) {
+        let codigo = packet[0] & 0x03;
+        self.codigo1 += usize::from(codigo == 1);
+        if codigo == 3 {
+            self.codigo3_constante += usize::from(packet[1] & 0x80 == 0);
+            self.relleno += usize::from(packet[1] & 0x40 != 0);
+        }
+        self.mayores_de_1275 += usize::from(packet.len() > 1275);
+    }
+}
+
+/// Barrera del formato de libopus (RFC 6716, apéndice B; `opus_packet_parse_impl` con
+/// `self_delimited`): dos flujos acoplados con los mismos paquetes de los 12 vectores, el primero
+/// autodelimitado, dan lo mismo que un `OpusDecoder` estéreo en cada flujo, en todos los paquetes.
+#[ignore = "necesita los vectores de RFC 8251 (OPUS_TESTVECTORS_DIR o la carpeta por defecto)"]
+#[test]
+fn multistream_lee_el_formato_autodelimitado_de_libopus() {
+    let max = OpusDecoder::MAX_FRAME_SIZE_48K;
+    let mut cobertura = Cobertura::default();
+    for k in 1..=12 {
+        let vector = format!("testvector{k:02}");
+        let packets = load_packets(&vector).unwrap();
+        let mut multi = OpusMultistreamDecoder::new(48_000, 4, 2, 2, &[0, 1, 2, 3]).unwrap();
+        let mut estereo = OpusDecoder::new(48_000, 2).unwrap();
+        for (n, packet) in packets.iter().enumerate() {
+            cobertura.contar(packet);
+            let mut est = vec![0i16; max * 2];
+            let muestras = estereo.decode(packet, &mut est, false).unwrap();
+            let mut pcm = vec![0i16; max * 4];
+            let multi_packet = build_multistream_packet(&[packet, packet]);
+            let resultado = multi.decode(&multi_packet, &mut pcm, false);
+            assert!(
+                matches!(resultado, Ok(m) if m == muestras),
+                "{vector}, paquete {n}: {resultado:?} (se esperaba Ok({muestras}))"
+            );
+            for (i, trama) in pcm[..muestras * 4].chunks_exact(4).enumerate() {
+                let esperado = [est[2 * i], est[2 * i + 1]];
+                assert!(
+                    trama[..2] == esperado && trama[2..] == esperado,
+                    "{vector}, paquete {n}, muestra {i}"
+                );
+            }
+        }
+    }
+    eprintln!("{cobertura:?}");
+    assert!(cobertura.codigo1 > 0, "{cobertura:?}");
+    assert!(cobertura.codigo3_constante > 0, "{cobertura:?}");
+    assert!(cobertura.relleno > 0, "{cobertura:?}");
+    assert!(cobertura.mayores_de_1275 > 0, "{cobertura:?}");
+}
+
+/// Con `fec`, si el paquete siguiente dura más que la pérdida, el multiflujo la oculta, como cada
+/// flujo (`OpusDecoder::decode` con `fec`), en vez de devolver un error como libopus, que recibe
+/// la duración pedida (`OPUS_BUFFER_TOO_SMALL` en `opus_multistream_decode_native`). Se prueba en
+/// cada paquete de los vectores que dura más que el anterior: la llamada con `fec` da, en los dos
+/// flujos, lo mismo que un `OpusDecoder` estéreo con el mismo estado.
+#[ignore = "necesita los vectores de RFC 8251 (OPUS_TESTVECTORS_DIR o la carpeta por defecto)"]
+#[test]
+fn multistream_fec_con_paquete_mas_largo_que_la_perdida_oculta() {
+    let max = OpusDecoder::MAX_FRAME_SIZE_48K;
+    let mut casos = 0usize;
+    for k in 1..=12 {
+        let vector = format!("testvector{k:02}");
+        let packets = load_packets(&vector).unwrap();
+        let mut sonda = OpusDecoder::new(48_000, 2).unwrap();
+        let mut sobra = vec![0i16; max * 2];
+        let duraciones: Vec<usize> = packets
+            .iter()
+            .map(|packet| sonda.decode(packet, &mut sobra, false).unwrap())
+            .collect();
+        let mut multi = OpusMultistreamDecoder::new(48_000, 4, 2, 2, &[0, 1, 2, 3]).unwrap();
+        let mut estereo = OpusDecoder::new(48_000, 2).unwrap();
+        for (n, packet) in packets.iter().enumerate() {
+            let multi_packet = build_multistream_packet(&[packet, packet]);
+            let llamadas: &[bool] = if n > 0 && duraciones[n] > duraciones[n - 1] {
+                casos += 1;
+                &[true, false]
+            } else {
+                &[false]
+            };
+            for &fec in llamadas {
+                let mut est = vec![0i16; max * 2];
+                let muestras = estereo.decode(packet, &mut est, fec).unwrap();
+                if fec {
+                    assert_eq!(muestras, duraciones[n - 1], "{vector}, paquete {n}");
+                }
+                let mut pcm = vec![0i16; max * 4];
+                let resultado = multi.decode(&multi_packet, &mut pcm, fec);
+                assert!(
+                    matches!(resultado, Ok(m) if m == muestras),
+                    "{vector}, paquete {n}, fec={fec}: {resultado:?} (se esperaba Ok({muestras}))"
+                );
+                for (i, trama) in pcm[..muestras * 4].chunks_exact(4).enumerate() {
+                    let esperado = [est[2 * i], est[2 * i + 1]];
+                    assert!(
+                        trama[..2] == esperado && trama[2..] == esperado,
+                        "{vector}, paquete {n}, fec={fec}, muestra {i}"
+                    );
+                }
+            }
+        }
+    }
+    eprintln!("paquetes más largos que el anterior: {casos}");
+    assert!(casos > 0, "ningún paquete dura más que el anterior");
+}

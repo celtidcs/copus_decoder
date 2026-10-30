@@ -1,6 +1,6 @@
 //! Funciones LPC de coma fija de SILK.
 
-use super::fixed::{inverse32_var_q, rshift_round, rshift_round64, smmul};
+use super::fixed::{inverse32_var_q, rshift_round, rshift_round64, sat16, smmul, smulbb};
 use super::tables::{LSF_COS_TAB, MAX_LPC_ORDER, ONE_Q16};
 
 const QA: usize = 16;
@@ -72,6 +72,50 @@ pub(super) fn lpc_inv_pred_gain(lpc_q12: &[i16], order: usize) -> i32 {
         return 0;
     }
     lpc_inverse_pred_gain_qa(&mut a_tmp_qa[..order], order)
+}
+
+/// Expansión de ancho de banda de los coeficientes `ar` de orden `order`, en Q12: el coeficiente
+/// `k` se multiplica por `chirp_q16` elevado a `k + 1`, con redondeo (`silk_bwexpander`). libopus
+/// evita aquí `silk_SMULWB` porque su sesgo puede volver inestable el filtro.
+pub(super) fn bwexpander(ar: &mut [i16], order: usize, chirp_q16: i32) {
+    let mut chirp_q16 = chirp_q16;
+    let chirp_minus_one_q16 = chirp_q16 - ONE_Q16;
+    for coeff in ar.iter_mut().take(order.saturating_sub(1)) {
+        *coeff = rshift_round(chirp_q16 * i32::from(*coeff), 16) as i16;
+        chirp_q16 += rshift_round(chirp_q16.wrapping_mul(chirp_minus_one_q16), 16);
+    }
+    if let Some(last) = order.checked_sub(1) {
+        ar[last] = rshift_round(chirp_q16 * i32::from(ar[last]), 16) as i16;
+    }
+}
+
+/// Filtro de análisis LPC (`silk_LPC_analysis_filter`) con el que se reblanquean las tramas
+/// sonoras y la historia de la ocultación: escribe en `output[..len]` el residuo en Q0 de `input` con los coeficientes `a_q12`
+/// de orden `order`. Las `order` primeras muestras quedan a cero.
+pub(super) fn lpc_analysis_filter(
+    output: &mut [i16],
+    input: &[i16],
+    a_q12: &[i16],
+    len: usize,
+    order: usize,
+) {
+    debug_assert!(order <= len);
+    output[..order].fill(0);
+    for ix in order..len {
+        let mut out32_q12 = smulbb(input[ix - 1] as i32, a_q12[0] as i32);
+        out32_q12 = out32_q12.wrapping_add(smulbb(input[ix - 2] as i32, a_q12[1] as i32));
+        out32_q12 = out32_q12.wrapping_add(smulbb(input[ix - 3] as i32, a_q12[2] as i32));
+        out32_q12 = out32_q12.wrapping_add(smulbb(input[ix - 4] as i32, a_q12[3] as i32));
+        out32_q12 = out32_q12.wrapping_add(smulbb(input[ix - 5] as i32, a_q12[4] as i32));
+        out32_q12 = out32_q12.wrapping_add(smulbb(input[ix - 6] as i32, a_q12[5] as i32));
+        for j in (6..order).step_by(2) {
+            out32_q12 = out32_q12.wrapping_add(smulbb(input[ix - 1 - j] as i32, a_q12[j] as i32));
+            out32_q12 =
+                out32_q12.wrapping_add(smulbb(input[ix - 2 - j] as i32, a_q12[j + 1] as i32));
+        }
+        let out32_q12 = ((input[ix] as i32) << 12).wrapping_sub(out32_q12);
+        output[ix] = sat16(rshift_round(out32_q12, 12));
+    }
 }
 
 /// Construye en `out[..=dd]` el polinomio par o impar de `nlsf2a` a partir de los cosenos

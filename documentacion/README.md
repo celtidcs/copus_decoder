@@ -1,28 +1,36 @@
-# Documentación de Copus_Decoder
+Documentación de Copus_Decoder
 
-Copus_Decoder es una copia corregida y auditada de `opus-decoder` 0.1.1, un decodificador Opus
-(RFC 6716 / RFC 8251) escrito en Rust puro, sin `unsafe` ni FFI. La razón de la copia y la
-licencia están en el [README principal](../README.md).
+Copus_Decoder es una copia corregida y auditada de opus-decoder 0.1.1, un decodificador Opus según
+RFC 6716 y RFC 8251 escrito en Rust puro, sin código inseguro ni FFI. La razón de ser de la copia y
+su licencia están en el README de la raíz del repositorio.
 
-| Documento | Para qué sirve |
-|---|---|
-| [funcionalidades.md](funcionalidades.md) | Qué decodifica, con qué parámetros y qué errores devuelve. |
-| [manual-de-uso.md](manual-de-uso.md) | Cómo usarlo como librería, paso a paso. |
-| [arquitectura.md](arquitectura.md) | Cómo está organizado el código y por qué. |
-| [historial-de-cambios.md](historial-de-cambios.md) | Qué ha cambiado respecto al original. |
-| [defectos-conocidos.md](defectos-conocidos.md) | Limitaciones y lo que no está comprobado. |
-| [infraestructura/vision-general.md](infraestructura/vision-general.md) | Componentes y entorno de pruebas. |
-| [infraestructura/requisitos.md](infraestructura/requisitos.md) | Herramientas y versiones necesarias. |
-| [infraestructura/guia-de-clonado.md](infraestructura/guia-de-clonado.md) | Clonar, compilar y verificar desde cero. |
+Esta carpeta reúne todo lo necesario para usar el decodificador y para seguir desarrollándolo. Si
+solo quieres usarlo, empieza por el manual de uso (manual-de-uso.md), que lleva de la dependencia a
+la decodificación de un flujo con pérdidas o multiflujo, y consulta las funcionalidades
+(funcionalidades.md) para saber qué parámetros acepta, qué devuelve y qué errores puede dar.
 
-## Garantía de equivalencia
+Si vas a tocar el código, la arquitectura (arquitectura.md) explica cómo está organizado, por qué
+sigue la estructura de libopus y qué comprueba cada batería de pruebas. El historial de cambios
+(historial-de-cambios.md) cuenta, versión a versión, qué se ha cambiado respecto al original y cómo
+se midió. Los defectos conocidos (defectos-conocidos.md) recogen, con cifras, lo que no funciona, lo
+que no coincide con libopus y lo que no está comprobado. La hoja de ruta (hoja-de-ruta.md) fija los
+hitos de la versión siguiente.
 
-Toda modificación del código se acepta solo si:
+La subcarpeta infraestructura describe el entorno. La visión general (infraestructura/vision-general.md)
+enumera los componentes y los datos de prueba; los requisitos (infraestructura/requisitos.md), las
+herramientas y versiones necesarias; y la guía de clonado (infraestructura/guia-de-clonado.md) lleva
+de un clon vacío a un decodificador compilado y verificado. Los guiones preparar-entorno.sh y
+preparar-entorno.ps1 preparan el entorno en Linux o macOS y en Windows, y la carpeta
+referencia-libopus contiene el guion que genera, en Linux, las referencias de libopus 1.6.1 con que
+se comparan las pruebas.
 
-1. Las pruebas, clippy (`-D warnings`), `cargo fmt --check` y `cargo audit` pasan en Windows y
-   Linux.
-2. Los 12 vectores de RFC 8251 pasan la comparación de calidad de `opus_compare`.
-3. La red de equivalencia (`tests/red_equivalencia.rs`) da las 111 huellas de
-   [`red/huellas.txt`](../red/huellas.txt), generadas con la 0.1.1 original salvo las que cambia a
-   propósito cada corrección (listadas en el historial de cambios). Una huella distinta significa
-   que la salida cambió en al menos una muestra.
+Garantía de equivalencia
+
+Ninguna modificación del código se acepta si no cumple tres condiciones. La primera, que las
+pruebas, clippy sin un solo aviso, cargo fmt --check y cargo audit pasen en Windows y en Linux. La
+segunda, que los doce vectores de RFC 8251 superen la comparación de calidad de opus_compare y que
+su salida no se aleje de la de referencia más de lo medido (tests/diferencia_libopus.rs). La
+tercera, que la red de equivalencia (tests/red_equivalencia.rs) dé las 111 huellas de
+red/huellas.txt. Esas huellas se generaron con la 0.1.1 original, salvo las que cada corrección
+cambia a propósito, que el historial de cambios enumera; una huella distinta significa que la
+salida cambió en al menos una muestra.

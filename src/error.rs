@@ -10,8 +10,6 @@ pub enum Error {
     InvalidSampleRate(u32),
     /// Número de canales no admitido (1 o 2).
     InvalidChannels(u8),
-    /// Paquete mayor que el máximo admitido: `max` bytes, recibidos `got`.
-    PacketTooLarge { max: usize, got: usize },
     /// El búfer de salida no basta: hacían falta `needed` muestras y tiene `got`.
     OutputTooSmall { needed: usize, got: usize },
     /// Paquete mal formado o incoherente.
@@ -25,9 +23,6 @@ impl fmt::Display for Error {
         match self {
             Error::InvalidSampleRate(fs) => write!(f, "invalid Opus output sample rate: {fs}"),
             Error::InvalidChannels(ch) => write!(f, "invalid Opus channel count: {ch}"),
-            Error::PacketTooLarge { max, got } => {
-                write!(f, "Opus packet too large (max {max}, got {got})")
-            }
             Error::OutputTooSmall { needed, got } => {
                 write!(f, "output buffer too small: needed {needed}, got {got}")
             }

@@ -1,0 +1,31 @@
+[package]
+name = "copus_decoder-fuzz"
+version = "0.0.0"
+edition = "2024"
+publish = false
+description = "Objetivos de fuzzing guiado por cobertura (cargo-fuzz) de copus_decoder"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+copus_decoder = { path = ".." }
+
+# Espacio de trabajo propio: el fuzzing necesita Rust nightly y no forma parte del crate, así que
+# `cargo test` en la raíz no lo compila.
+[workspace]
+
+[[bin]]
+name = "decodificar"
+path = "fuzz_targets/decodificar.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "multiflujo"
+path = "fuzz_targets/multiflujo.rs"
+test = false
+doc = false
+bench = false

@@ -1,19 +1,23 @@
-# Visión general de la infraestructura
+Visión general de la infraestructura
 
-Copus_Decoder es una librería Rust sin servicios externos, red ni configuración en tiempo de
-ejecución. Lo único externo son los datos de prueba.
+Copus_Decoder es una librería de Rust sin servicios externos, sin red y sin configuración en tiempo
+de ejecución. Lo único que viene de fuera son los datos de prueba.
 
-| Componente | Dónde | Notas |
-|---|---|---|
-| Código fuente | `src/`, `tests/` | Crate `copus_decoder`, edición 2024. |
-| Dependencia | `thiserror` | Única dependencia, para los errores públicos. |
-| Vectores de RFC 8251 | `material_secundario/vectores/` (no versionado) | Se descargan de opus-codec.org con SHA-256 comprobado. |
-| Huellas de equivalencia | `red/huellas.txt` | Versionado; generado con la 0.1.1 original. |
-| Compilación | `target/` (no versionado) | La carpeta por defecto de cargo. |
+El código fuente está en src y en tests, y forma el crate copus_decoder, en la edición 2024 de
+Rust. Su única dependencia es thiserror, que da forma a los errores públicos. Las huellas de la red
+de equivalencia están versionadas en red/huellas.txt. La compilación va a la carpeta target, la que
+cargo usa por defecto, que no se versiona.
 
-No hay variables de entorno obligatorias para compilar, usar la librería ni pasar las pruebas. Las
-que necesitan los vectores los buscan en `material_secundario/vectores/opus_newvectors`, o en la
-carpeta que indique `OPUS_TESTVECTORS_DIR`.
+Los vectores oficiales de RFC 8251 no se versionan: los guiones de preparación los descargan de
+opus-codec.org a material_secundario/vectores, comprobando su SHA-256. Las referencias de libopus
+1.6.1 tampoco: son opcionales y las genera, en Linux, el guion
+documentacion/infraestructura/referencia-libopus/generar.sh, que las deja en
+material_secundario/vectores/referencia-libopus-1.6.1 y las comprueba con su manifiesto.
 
-Las puertas de calidad (pruebas, clippy, formato y `cargo audit`) se ejecutan en Windows y Linux
+No hace falta ninguna variable de entorno para compilar, usar la librería ni pasar las pruebas. Las
+pruebas que necesitan los vectores los buscan en material_secundario/vectores/opus_newvectors, o en
+la carpeta que indique OPUS_TESTVECTORS_DIR. Las de tests/referencia_libopus.rs buscan las
+referencias de libopus en su carpeta por defecto, o en la que indique OPUS_REFERENCIA_LIBOPUS_DIR.
+
+Las puertas de calidad (pruebas, clippy, formato y cargo audit) se ejecutan en Windows y en Linux
 antes de aceptar cualquier cambio.

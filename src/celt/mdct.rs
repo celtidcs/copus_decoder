@@ -1,27 +1,39 @@
 //! MDCT inversa de CELT (`clt_mdct_backward`), con el solapamiento y la ventana como en
 //! libopus. Hay una por tamaño de trama; el banco las agrupa (`synthesis.rs`).
 
-use crate::celt::kiss_fft::flat_fft_forward;
+use super::kiss_fft::{Cpx, FFT_STATES, FftState, fft_impl};
+use super::static_tables::MDCT_TWIDDLES;
 
-/// MDCT inversa de un tamaño, con sus tablas trigonométricas.
+/// Tamaño de la MDCT más larga del modo (`mdct.n`): dos tramas de 960 muestras.
+const MAX_MDCT_SIZE: usize = 1920;
+
+/// MDCT inversa de un tamaño, con su parte de la tabla de giros y su FFT.
 #[derive(Debug, Clone)]
 pub(crate) struct MdctBackward {
     n: usize,
     overlap: usize,
-    trig: Vec<f32>,
+    trig: &'static [f32],
+    fft: &'static FftState,
 }
 
 impl MdctBackward {
-    /// Prepara la MDCT inversa de tamaño `n` (por ejemplo, 960) con `overlap` muestras de
-    /// solapamiento (por ejemplo, 120), y calcula sus tablas trigonométricas.
-    pub fn new(n: usize, overlap: usize) -> Self {
-        let n2 = n / 2;
-        let mut trig = Vec::with_capacity(n2);
-        for j in 0..n2 {
-            let phase = 2.0_f64 * core::f64::consts::PI * (j as f64 + 0.125_f64) / n as f64;
-            trig.push(phase.cos() as f32);
+    /// Prepara la MDCT inversa de tamaño `1920 >> shift` (`shift` de 0 a 3, como el de
+    /// `clt_mdct_backward`) con `overlap` muestras de solapamiento (por ejemplo, 120). Sus giros
+    /// son el tramo de `mdct_twiddles960` que libopus salta con ese `shift`.
+    ///
+    /// # Pánicos
+    ///
+    /// Si `shift` pasa de 3.
+    pub fn new(shift: usize, overlap: usize) -> Self {
+        let n = MAX_MDCT_SIZE >> shift;
+        // libopus salta, por cada paso de `shift`, la mitad del tamaño anterior: 960, 480 y 240.
+        let offset = MAX_MDCT_SIZE - n;
+        Self {
+            n,
+            overlap,
+            trig: &MDCT_TWIDDLES[offset..offset + n / 2],
+            fft: &FFT_STATES[shift],
         }
-        Self { n, overlap, trig }
     }
 
     /// MDCT inversa de `input` (`N/2` coeficientes) con la ventana `window` (`overlap`
@@ -49,23 +61,24 @@ impl MdctBackward {
             return Err("mdct backward window length mismatch");
         }
 
-        // Búfer complejo entrelazado: [re0, im0, re1, im1, ...].
-        let mut f2 = vec![0.0f32; n2];
-        let t = &self.trig;
+        let t = self.trig;
+        let mut fft_buf = vec![Cpx::default(); n4];
         for i in 0..n4 {
             let xp1 = input[2 * i];
             let xp2 = input[n2 - 1 - 2 * i];
             // Prerrotación de `clt_mdct_backward` en coma flotante.
             let yr = xp2 * t[i] + xp1 * t[n4 + i];
             let yi = xp1 * t[i] - xp2 * t[n4 + i];
-            // Se intercambian real e imaginaria, como libopus, para usar la FFT directa como inversa.
-            f2[2 * i] = yi;
-            f2[2 * i + 1] = yr;
+            // Se intercambian real e imaginaria, como libopus, para usar la FFT directa como
+            // inversa, y se guarda ya en el orden de inversión de dígitos de la FFT.
+            fft_buf[self.fft.bitrev[i] as usize] = Cpx { r: yi, i: yr };
         }
-        let mut f2_out = vec![0.0f32; n2];
-        flat_fft_forward(&f2, &mut f2_out);
+        fft_impl(self.fft, &mut fft_buf);
         let ov2 = overlap >> 1;
-        out[ov2..ov2 + n2].copy_from_slice(&f2_out[..n2]);
+        for (pair, v) in out[ov2..ov2 + n2].chunks_exact_mut(2).zip(&fft_buf) {
+            pair[0] = v.r;
+            pair[1] = v.i;
+        }
         let mut p0 = ov2;
         let mut p1 = ov2 + n2 - 2;
         for i in 0..((n4 + 1) >> 1) {
@@ -109,7 +122,7 @@ mod tests {
 
     #[test]
     fn mdct_backward_validates_lengths() {
-        let mdct = MdctBackward::new(960, 120);
+        let mdct = MdctBackward::new(1, 120);
         let input = vec![0.0f32; 480];
         let window = vec![1.0f32; 120];
         let mut out = vec![0.0f32; 960];
