@@ -14,6 +14,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include "salida.h"
 
 /* Carga máxima que se acepta en un registro: un paquete Opus no pasa de 1275 bytes por trama y
    48 tramas, así que 64 KiB sobra; un valor mayor indica un archivo dañado. */
@@ -47,7 +48,7 @@ int main(int argc, char **argv) {
     }
     ent = fopen(argv[1], "rb");
     if (!ent) { perror(argv[1]); return 1; }
-    sal = fopen(argv[3], "wb");
+    sal = crear_salida(argv[3]);
     if (!sal) { perror(argv[3]); return 1; }
     while (leer_u32(ent, &largo)) {
         if (!leer_u32(ent, &rango) || largo > MAX_CARGA || fread(carga, 1, largo, ent) != largo) {

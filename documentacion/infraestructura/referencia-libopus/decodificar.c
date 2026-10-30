@@ -17,6 +17,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include "opus.h"
+#include "salida.h"
 
 /* Carga máxima de un registro: un paquete Opus no pasa de 1275 bytes por trama y 48 tramas, así
    que 64 KiB sobra; un valor mayor indica un archivo dañado. */
@@ -68,7 +69,7 @@ int main(int argc, char **argv) {
     opus_int32 frecuencia = atoi(argv[1]);
     int canales = atoi(argv[2]);
     FILE *entrada = fopen(argv[3], "rb");
-    FILE *salida = fopen(argv[4], "wb");
+    FILE *salida = crear_salida(argv[4]);
     if (!entrada || !salida) {
         fprintf(stderr, "no se puede abrir %s o %s\n", argv[3], argv[4]);
         return 1;

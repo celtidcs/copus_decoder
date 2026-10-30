@@ -3,6 +3,17 @@ Historial de cambios
 Cambios de Copus_Decoder respecto a opus-decoder 0.1.1. El historial de git conserva cada paso por
 separado, empezando por el paquete original intacto.
 
+Versión 0.2.1, del 30 de octubre de 2026
+
+Corrección de la versión 0.2.1
+
+Los programas en C que generan las referencias de libopus crean sus archivos con permisos
+explícitos. Abrían cada salida con fopen, que crea el archivo con los permisos que deja la máscara
+del proceso, y con una máscara permisiva cualquiera habría podido escribir en las referencias; el
+análisis de código de GitHub lo señaló en nueve sitios. Ahora todos usan crear_salida, del nuevo
+salida.h, que crea el archivo con lectura para todos y escritura solo para su dueño, sea cual sea
+la máscara. Las referencias generadas son las mismas, byte a byte, y el decodificador no cambia.
+
 Versión 0.2.0, del 30 de octubre de 2026
 
 La 0.2.0 acerca el decodificador a libopus 1.6.1, la implementación de referencia de Opus, en todo

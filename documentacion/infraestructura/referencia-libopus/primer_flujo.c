@@ -11,6 +11,7 @@
  */
 #include <stdio.h>
 #include <stdlib.h>
+#include "salida.h"
 
 /* Carga máxima que se acepta en un registro (ver perdidas.c). */
 #define MAX_CARGA 65536
@@ -98,7 +99,7 @@ int main(int argc, char **argv) {
     }
     ent = fopen(argv[1], "rb");
     if (!ent) { perror(argv[1]); return 1; }
-    sal = fopen(argv[2], "wb");
+    sal = crear_salida(argv[2]);
     if (!sal) { perror(argv[2]); return 1; }
     while (leer_u32(ent, &largo)) {
         if (!leer_u32(ent, &rango) || largo > MAX_CARGA || fread(carga, 1, largo, ent) != largo

@@ -100,7 +100,7 @@ Uso rápido
 En el Cargo.toml de tu proyecto, la dependencia apunta a este repositorio, fijada a una versión:
 
     [dependencies]
-    copus_decoder = { git = "https://github.com/celtidcs/copus_decoder", tag = "v0.2.0" }
+    copus_decoder = { git = "https://github.com/celtidcs/copus_decoder", tag = "v0.2.1" }
 
 Y para decodificar un paquete:
 

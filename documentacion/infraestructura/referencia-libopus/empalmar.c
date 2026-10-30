@@ -11,6 +11,7 @@
  */
 #include <stdio.h>
 #include <stdlib.h>
+#include "salida.h"
 
 #define MAX_ENTRADAS 8
 /* Carga máxima que se acepta en un registro (ver perdidas.c). */
@@ -50,7 +51,7 @@ int main(int argc, char **argv) {
         entradas[i] = fopen(argv[3 + i], "rb");
         if (!entradas[i]) { perror(argv[3 + i]); return 1; }
     }
-    sal = fopen(argv[2], "wb");
+    sal = crear_salida(argv[2]);
     if (!sal) { perror(argv[2]); return 1; }
     for (;; n++) {
         int elegida = (int)((n / bloque) % nentradas), fin = 0;

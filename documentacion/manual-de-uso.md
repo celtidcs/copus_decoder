@@ -6,7 +6,7 @@ Copus_Decoder no se publica en crates.io; se usa directamente desde su repositor
 Cargo.toml de tu proyecto, fíjalo a una versión con su etiqueta:
 
     [dependencies]
-    copus_decoder = { git = "https://github.com/celtidcs/copus_decoder", tag = "v0.2.0" }
+    copus_decoder = { git = "https://github.com/celtidcs/copus_decoder", tag = "v0.2.1" }
 
 Si vienes de opus-decoder, basta con cambiar la dependencia y sustituir opus_decoder por
 copus_decoder en las rutas: la API es la misma.

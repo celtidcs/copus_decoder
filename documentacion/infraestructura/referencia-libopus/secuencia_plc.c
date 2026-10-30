@@ -10,6 +10,7 @@
  */
 #include <stdio.h>
 #include <stdlib.h>
+#include "salida.h"
 
 /* Carga máxima que se acepta en un registro (ver perdidas.c). */
 #define MAX_CARGA 65536
@@ -53,7 +54,7 @@ int main(int argc, char **argv) {
     }
     ent = fopen(argv[1], "rb");
     if (!ent) { perror(argv[1]); return 1; }
-    sal = fopen(argv[4], "wb");
+    sal = crear_salida(argv[4]);
     if (!sal) { perror(argv[4]); return 1; }
     if (copiar_paquetes(ent, sal, buenos) != 0) goto corto;
     for (i = 0; i < perdidas; i++) {

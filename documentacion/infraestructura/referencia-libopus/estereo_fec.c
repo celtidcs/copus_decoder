@@ -7,6 +7,7 @@
  */
 #include <stdio.h>
 #include "opus.h"
+#include "salida.h"
 
 #define TRAMA 960
 #define BLOQUE 7
@@ -18,7 +19,7 @@ static void be32(unsigned char *b, opus_uint32 v) {
 
 int main(int argc, char **argv) {
     if (argc != 3) return 2;
-    FILE *in = fopen(argv[1], "rb"), *out = fopen(argv[2], "wb");
+    FILE *in = fopen(argv[1], "rb"), *out = crear_salida(argv[2]);
     if (!in || !out) return 1;
     int error, paquetes = 0, con_lbrr = 0, cambios = 0, prev_estereo = -1;
     OpusEncoder *enc = opus_encoder_create(48000, 2, OPUS_APPLICATION_VOIP, &error);

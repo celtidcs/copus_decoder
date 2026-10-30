@@ -25,6 +25,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <opus_multistream.h>
+#include "salida.h"
 
 #define FS 48000
 #define CANALES 3
@@ -107,7 +108,7 @@ int main(int argc, char **argv) {
     }
 
     /* 2) Escribir el flujo y decodificarlo. */
-    FILE *fb = fopen(argv[4], "wb"), *fd = fopen(argv[5], "wb");
+    FILE *fb = crear_salida(argv[4]), *fd = crear_salida(argv[5]);
     short out[MAX_TRAMA * CANALES];
     int ultima = 960;
     for (int i = 0; i < np; i++) {

@@ -12,6 +12,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <opus.h>
+#include "salida.h"
 
 #define FS 48000
 #define TRAMA 960
@@ -40,7 +41,7 @@ int main(int argc, char **argv) {
     }
     fe = fopen(argv[1], "rb");
     if (!fe) { perror(argv[1]); return 1; }
-    fs = fopen(argv[2], "wb");
+    fs = crear_salida(argv[2]);
     if (!fs) { perror(argv[2]); return 1; }
     enc = opus_encoder_create(FS, 1, OPUS_APPLICATION_VOIP, &err);
     if (err != OPUS_OK) { fprintf(stderr, "enc %d\n", err); return 1; }
